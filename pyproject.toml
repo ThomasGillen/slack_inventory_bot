@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slack-inventory-bot"
+version = "0.1.0"
+description = "A Slack reservation bot backed by Google Sheets"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "google-api-python-client>=2.100",
+  "google-auth>=2.20",
+  "slack-bolt>=1.20",
+  "tzdata>=2024.1; platform_system == 'Windows'",
+]
+
+[project.scripts]
+inventory-bot = "inventory_bot.__main__:main"
+inventory-sheet-init = "inventory_bot.init_sheet:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
