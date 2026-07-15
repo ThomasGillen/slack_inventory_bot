@@ -18,7 +18,26 @@ class ReservationParserTests(TestCase):
         )
 
         self.assertEqual("kayak1", parsed.item_query)
+        self.assertEqual(self.now.astimezone(UTC), parsed.start_at_utc)
         self.assertEqual(datetime(2026, 7, 15, 22, 0, tzinfo=UTC), parsed.end_at_utc)
+
+    def test_parses_future_start_and_end(self) -> None:
+        parsed = parse_reservation_message(
+            "reserve kayak1 from tomorrow at 1 PM until tomorrow at 3 PM",
+            timezone=self.timezone,
+            now=self.now,
+        )
+
+        self.assertEqual(datetime(2026, 7, 15, 20, 0, tzinfo=UTC), parsed.start_at_utc)
+        self.assertEqual(datetime(2026, 7, 15, 22, 0, tzinfo=UTC), parsed.end_at_utc)
+
+    def test_rejects_end_before_start(self) -> None:
+        with self.assertRaisesRegex(ParseError, "after its start"):
+            parse_reservation_message(
+                "reserve kayak1 from tomorrow at 3 PM until tomorrow at 1 PM",
+                timezone=self.timezone,
+                now=self.now,
+            )
 
     def test_parses_upcoming_weekday(self) -> None:
         parsed = parse_reservation_message(

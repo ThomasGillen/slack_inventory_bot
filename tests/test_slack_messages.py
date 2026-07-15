@@ -9,6 +9,7 @@ from inventory_bot.models import (
     PendingReservation,
     PreparedReservation,
     Reservation,
+    ScheduledReservation,
 )
 from inventory_bot.slack_app import (
     _slack_user_name,
@@ -28,6 +29,7 @@ class SlackMessageTests(TestCase):
         item = Item("kayak1", "A")
         pending = PendingReservation(
             item_name="kayak1",
+            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
             end_at_utc=self.end,
             requester_user_id="U123",
         )
@@ -61,16 +63,24 @@ class SlackMessageTests(TestCase):
         self.assertEqual("U123", pending.requester_user_id)
 
     def test_new_button_payload_contains_only_required_fields(self) -> None:
-        pending = PendingReservation("kayak1", self.end, "U123")
+        pending = PendingReservation(
+            "kayak1",
+            self.end,
+            "U123",
+            datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+        )
 
         payload = json.loads(pending.to_action_value())
 
-        self.assertEqual({"v", "n", "e", "u"}, set(payload))
+        self.assertEqual({"v", "n", "b", "e", "u"}, set(payload))
+        self.assertEqual(4, payload["v"])
 
     def test_committed_message_contains_item_and_end_time(self) -> None:
         reservation = Reservation(
+            reservation_id="R1",
             item_name="kayak1",
             location="A",
+            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
             end_at_utc=self.end,
         )
 
@@ -78,6 +88,7 @@ class SlackMessageTests(TestCase):
 
         self.assertIn("kayak1", text)
         self.assertIn("kayak1", str(blocks))
+        self.assertIn("Starts", str(blocks))
 
     def test_status_shows_current_owner_and_end_time(self) -> None:
         item = Item("kayak1", "A", self.end, "U123")
@@ -91,6 +102,31 @@ class SlackMessageTests(TestCase):
 
     def test_help_includes_cancel_command(self) -> None:
         self.assertIn("cancel <item>", help_text())
+        self.assertIn("from <date/time>", help_text())
+
+    def test_status_shows_next_scheduled_reservation(self) -> None:
+        next_reservation = ScheduledReservation(
+            "R1",
+            "kayak1",
+            datetime(2026, 7, 16, 20, 0, tzinfo=UTC),
+            datetime(2026, 7, 16, 22, 0, tzinfo=UTC),
+            "Taylor Smith",
+            "U123",
+        )
+
+        text = status_text(
+            [
+                InventoryAvailability(
+                    item=Item("kayak1", "A"),
+                    available=True,
+                    next_reservation=next_reservation,
+                )
+            ],
+            self.settings,
+        )
+
+        self.assertIn("available now; next reserved", text)
+        self.assertIn("Taylor Smith", text)
 
     def test_slack_user_name_prefers_display_name(self) -> None:
         class Client:

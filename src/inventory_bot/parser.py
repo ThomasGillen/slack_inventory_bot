@@ -9,7 +9,9 @@ from .models import ParsedReservation
 
 MENTION_RE = re.compile(r"<@[A-Z0-9]+>", re.IGNORECASE)
 RESERVATION_RE = re.compile(
-    r"^reserve\s+(?P<item>.+?)\s+until\s+(?P<end>.+)$",
+    r"^reserve\s+(?P<item>.+?)"
+    r"(?:\s+from\s+(?P<start>.+?))?"
+    r"\s+until\s+(?P<end>.+)$",
     re.IGNORECASE,
 )
 WEEKDAYS = {
@@ -37,8 +39,8 @@ def parse_reservation_message(
     match = RESERVATION_RE.fullmatch(cleaned)
     if not match:
         raise ParseError(
-            'Use: reserve <item> until <date and time>. '
-            'Example: reserve kayak1 until tomorrow at 3 PM'
+            "Use: reserve <item> [from <date and time>] until <date and time>. "
+            "Example: reserve kayak1 from Friday at 1 PM until Friday at 3 PM"
         )
 
     item_query = match.group("item").strip().strip('"\'')
@@ -51,12 +53,24 @@ def parse_reservation_message(
     else:
         current = current.astimezone(timezone)
 
+    start_value = match.group("start")
+    start_local = (
+        parse_end_time(start_value, timezone=timezone, now=current)
+        if start_value
+        else current
+    )
+    if start_value and start_local < current:
+        raise ParseError("Reservation start time cannot be in the past.")
+
     end_local = parse_end_time(match.group("end"), timezone=timezone, now=current)
     if end_local <= current:
         raise ParseError("Reservation end time must be in the future.")
+    if end_local <= start_local:
+        raise ParseError("Reservation end time must be after its start time.")
 
     return ParsedReservation(
         item_query=item_query,
+        start_at_utc=start_local.astimezone(UTC),
         end_at_utc=end_local.astimezone(UTC),
     )
 

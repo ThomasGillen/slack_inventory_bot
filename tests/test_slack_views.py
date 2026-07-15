@@ -10,6 +10,14 @@ from inventory_bot.slack_views import (
     ITEM_BLOCK,
     OPEN_RESERVATION_ACTION,
     RESERVATION_MODAL_CALLBACK,
+    START_DATE_ACTION,
+    START_DATE_BLOCK,
+    START_MODE_ACTION,
+    START_MODE_BLOCK,
+    START_NOW_VALUE,
+    START_SCHEDULED_VALUE,
+    START_TIME_ACTION,
+    START_TIME_BLOCK,
     TIME_ACTION,
     TIME_BLOCK,
     ModalDestination,
@@ -43,9 +51,19 @@ class SlackViewTests(TestCase):
 
         self.assertEqual(RESERVATION_MODAL_CALLBACK, modal["callback_id"])
         self.assertEqual("external_select", modal["blocks"][0]["element"]["type"])
-        self.assertEqual("datepicker", modal["blocks"][1]["element"]["type"])
-        self.assertEqual("timepicker", modal["blocks"][2]["element"]["type"])
-        self.assertEqual("2026-07-15", modal["blocks"][1]["element"]["initial_date"])
+        self.assertEqual("radio_buttons", modal["blocks"][1]["element"]["type"])
+        self.assertEqual(
+            START_NOW_VALUE,
+            modal["blocks"][1]["element"]["initial_option"]["value"],
+        )
+        self.assertEqual("datepicker", modal["blocks"][2]["element"]["type"])
+        self.assertEqual("timepicker", modal["blocks"][3]["element"]["type"])
+        self.assertEqual("datepicker", modal["blocks"][4]["element"]["type"])
+        self.assertEqual("timepicker", modal["blocks"][5]["element"]["type"])
+        self.assertEqual("2026-07-14", modal["blocks"][2]["element"]["initial_date"])
+        self.assertEqual("23:15", modal["blocks"][3]["element"]["initial_time"])
+        self.assertEqual("2026-07-15", modal["blocks"][4]["element"]["initial_date"])
+        self.assertEqual("00:15", modal["blocks"][5]["element"]["initial_time"])
 
     def test_item_options_include_location_and_stable_value(self) -> None:
         options = item_options([Item("kayak1", "Dock A")])
@@ -64,6 +82,17 @@ class SlackViewTests(TestCase):
                             "selected_option": {"value": "kayak1"}
                         }
                     },
+                    START_MODE_BLOCK: {
+                        START_MODE_ACTION: {
+                            "selected_option": {"value": START_SCHEDULED_VALUE}
+                        }
+                    },
+                    START_DATE_BLOCK: {
+                        START_DATE_ACTION: {"selected_date": "2026-07-15"}
+                    },
+                    START_TIME_BLOCK: {
+                        START_TIME_ACTION: {"selected_time": "15:00"}
+                    },
                     DATE_BLOCK: {DATE_ACTION: {"selected_date": "2026-07-15"}},
                     TIME_BLOCK: {TIME_ACTION: {"selected_time": "17:00"}},
                 }
@@ -78,7 +107,35 @@ class SlackViewTests(TestCase):
         )
 
         self.assertEqual("kayak1", pending.item_name)
+        self.assertEqual(datetime(2026, 7, 15, 15, 0, tzinfo=UTC), pending.start_at_utc)
         self.assertEqual(datetime(2026, 7, 15, 17, 0, tzinfo=UTC), pending.end_at_utc)
+
+    def test_start_now_uses_exact_submission_time(self) -> None:
+        view = {
+            "state": {
+                "values": {
+                    ITEM_BLOCK: {
+                        ITEM_ACTION: {"selected_option": {"value": "kayak1"}}
+                    },
+                    START_MODE_BLOCK: {
+                        START_MODE_ACTION: {
+                            "selected_option": {"value": START_NOW_VALUE}
+                        }
+                    },
+                    DATE_BLOCK: {DATE_ACTION: {"selected_date": "2026-07-15"}},
+                    TIME_BLOCK: {TIME_ACTION: {"selected_time": "01:00"}},
+                }
+            }
+        }
+
+        pending = parse_modal_submission(
+            view,
+            settings=self.settings,
+            requester_user_id="U123",
+            now=self.now,
+        )
+
+        self.assertEqual(self.now, pending.start_at_utc)
 
     def test_past_modal_time_returns_time_field_error(self) -> None:
         view = {
@@ -89,7 +146,52 @@ class SlackViewTests(TestCase):
                             "selected_option": {"value": "kayak1"}
                         }
                     },
+                    START_MODE_BLOCK: {
+                        START_MODE_ACTION: {
+                            "selected_option": {"value": START_SCHEDULED_VALUE}
+                        }
+                    },
+                    START_DATE_BLOCK: {
+                        START_DATE_ACTION: {"selected_date": "2026-07-14"}
+                    },
+                    START_TIME_BLOCK: {
+                        START_TIME_ACTION: {"selected_time": "16:00"}
+                    },
                     DATE_BLOCK: {DATE_ACTION: {"selected_date": "2026-07-14"}},
+                    TIME_BLOCK: {TIME_ACTION: {"selected_time": "17:00"}},
+                }
+            }
+        }
+
+        with self.assertRaises(ModalInputError) as raised:
+            parse_modal_submission(
+                view,
+                settings=self.settings,
+                requester_user_id="U123",
+                now=self.now,
+            )
+
+        self.assertEqual(START_TIME_BLOCK, raised.exception.block_id)
+
+    def test_end_before_start_returns_end_field_error(self) -> None:
+        view = {
+            "state": {
+                "values": {
+                    ITEM_BLOCK: {
+                        ITEM_ACTION: {"selected_option": {"value": "kayak1"}}
+                    },
+                    START_MODE_BLOCK: {
+                        START_MODE_ACTION: {
+                            "selected_option": {"value": START_SCHEDULED_VALUE}
+                        }
+                    },
+                    START_DATE_BLOCK: {
+                        START_DATE_ACTION: {"selected_date": "2026-07-15"}
+                    },
+                    START_TIME_BLOCK: {
+                        START_TIME_ACTION: {"selected_time": "18:00"}
+                    },
+                    DATE_BLOCK: {DATE_ACTION: {"selected_date": "2026-07-15"}},
                     TIME_BLOCK: {TIME_ACTION: {"selected_time": "17:00"}},
                 }
             }

@@ -8,10 +8,12 @@ and updates the item's current reservation state.
 
 - Direct messages through Slack's `message.im` event
 - Channel requests through the `app_mention` event
-- Block Kit reservation modal with a live item search, date picker, and time picker
+- Block Kit reservation modal with item search plus start/end date and time pickers
 - Global **Reserve an item** Slack shortcut
 - One unique inventory item per sheet row
-- Item name and reservation end-time parsing
+- Immediate and future reservation scheduling
+- Overlap rejection, with back-to-back reservations allowed
+- Automatic activation and expiry reconciliation every 30 seconds
 - Confirm and Cancel buttons before a sheet write
 - Owner-only `cancel <item>` for confirmed reservations
 - Availability checks before confirmation and immediately before writing
@@ -22,7 +24,7 @@ and updates the item's current reservation state.
 Example requests:
 
 ```text
-reserve kayak1 until Friday at 3 PM
+reserve kayak1 from Friday at 1 PM until Friday at 3 PM
 reserve kayak2 until tomorrow at 5 PM
 reserve kayak3 until 2026-07-18 17:00
 status
@@ -31,12 +33,25 @@ cancel kayak1
 ```
 
 The preferred reservation flow is to send `reserve`, click **Open reservation
-form**, and use the dropdown and date/time controls. The full text form remains
-available as a fallback.
+form**, and use the dropdown and start/end controls. **Start now** is selected by
+default and uses the exact time the form is submitted; choose **Schedule for
+later** to use the scheduled start fields. The full text form remains available
+as a fallback.
 
 ## Availability model
 
-The `Items` tab is the source of truth and has four columns:
+The `Reservations` tab is the schedule source of truth:
+
+| reservation_id | item_name | start_time | end_time | reserved_by | slack_user_id |
+|---|---|---|---|---|---|
+| generated UUID | kayak1 | 2026-07-18 01:00 PM PDT (UTC-07:00) | 2026-07-18 05:00 PM PDT (UTC-07:00) | Taylor Smith | U123... |
+
+The bot writes a row as soon as a reservation is confirmed. It rejects a new
+reservation when its `[start, end)` interval overlaps another row for the same
+item. Because the end is exclusive, one reservation may start exactly when the
+previous one ends.
+
+The `Items` tab remains the simple live inventory view:
 
 | item_name | location | reservation_end | reserved_by |
 |---|---|---|---|
@@ -44,11 +59,14 @@ The `Items` tab is the source of truth and has four columns:
 | kayak2 | B |  |  |
 | kayak3 | A |  |  |
 
-- A blank or past `reservation_end` means the item is available.
-- A future `reservation_end` means the item is reserved.
-- On confirmation, the bot writes the end time and the person's Slack display
-  name into that row (or their real name when no display name is set).
-- `cancel <item>` clears both reservation cells when requested by that person.
+- Before a future reservation starts, its `Items` row remains available.
+- Within 30 seconds after the start, the bot writes its end time and holder name
+  into `Items`.
+- Within 30 seconds after the end, the bot clears the two live-state cells and
+  removes the ended row from `Reservations`.
+- The same reconciliation runs immediately at startup, so downtime is repaired.
+- `cancel <item>` cancels the person's active reservation, or their earliest
+  upcoming reservation when none is active.
 - Every item implicitly has quantity 1.
 - Item names must be unique; the name acts as the lookup key.
 - Partial names work only when they match exactly one item.
@@ -145,6 +163,16 @@ inventory-sheet-init --migrate-items
 The migration duplicates the current tab to a timestamped `Items Backup ...` tab
 before converting it.
 
+For this scheduled-reservation upgrade, initialize the new schedule tab with:
+
+```powershell
+inventory-sheet-init --migrate-reservations
+```
+
+If an older `Reservations` tab exists, the command copies it to a timestamped
+`Reservations Backup ...` tab before replacing its headers. Any currently active
+state in `Items` is then seeded into the new schedule so it is not lost.
+
 After migration, add or edit items in the first two columns only:
 
 | item_name | location | reservation_end | reserved_by |
@@ -154,8 +182,10 @@ After migration, add or edit items in the first two columns only:
 
 Normally, leave `reservation_end` and `reserved_by` for the bot to manage. To
 release your own item early, send `cancel <item>` to the bot. A sheet manager can
-also clear both cells manually. A `-` is accepted as an empty reservation end,
-though a blank cell is preferred.
+cancel any booking by clearing its complete row in `Reservations`; the bot will
+then reconcile `Items`. Clearing only the live `Items` cells is temporary because
+an active schedule row will restore them. A `-` is accepted as an empty
+reservation end, though a blank cell is preferred.
 
 ## 5. Run the bot
 
@@ -171,8 +201,8 @@ reserve
 ```
 
 Then click **Open reservation form**. The item control searches the current
-Google Sheet and only offers items whose reservation has expired or is blank.
-The modal's date and time controls use `INVENTORY_TIMEZONE`.
+Google Sheet and offers every configured item. The modal's start/end controls use
+`INVENTORY_TIMEZONE`; conflicts are checked when the reservation is committed.
 
 The process must stay running to receive Socket Mode events. For production,
 deploy one continuously running instance and place all tokens and Google
@@ -187,7 +217,7 @@ ALLOWED_USER_IDS=U01234567,U07654321
 
 Direct messages bypass the channel allowlist but still honor the user allowlist.
 
-## Supported end-time formats
+## Supported start/end formats
 
 - `tomorrow at 3 PM`
 - `Friday at 3 PM`
@@ -198,6 +228,13 @@ Direct messages bypass the channel allowlist but still honor the user allowlist.
 
 Times without an explicit offset are interpreted using `INVENTORY_TIMEZONE`.
 Ambiguous, invalid, or past times are rejected rather than guessed.
+
+The text form accepts either an explicit start or an immediate reservation:
+
+```text
+reserve kayak1 from tomorrow at 1 PM until tomorrow at 3 PM
+reserve kayak1 until tomorrow at 3 PM
+```
 
 ## Tests
 
@@ -213,10 +250,9 @@ python -m compileall -q src
 
 - The process-level lock protects one bot instance. Do not horizontally scale the
   bot while Google Sheets is the source of truth.
-- Cancellation matches the requester's current Slack name (and still recognizes
-  legacy Slack IDs). Because the four-column sheet does not retain a hidden user
-  ID, duplicate or changed Slack names may require a sheet manager to clear
-  `reservation_end` and `reserved_by` manually.
-- The simplified sheet stores current state, not reservation history.
+- New scheduled rows retain the Slack user ID internally for owner-safe
+  cancellation; `Items` still shows only the readable holder name.
+- Ended schedule rows are removed, so the sheet does not provide reservation
+  history.
 - Google Sheets is appropriate for a modest internal inventory. A transactional
   database should replace it if reservation volume or business criticality grows.

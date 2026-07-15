@@ -41,6 +41,7 @@ class Settings:
     service_account_file: str | None = None
     service_account_json: str | None = None
     items_sheet: str = "Items"
+    reservations_sheet: str = "Reservations"
     allowed_channel_ids: frozenset[str] = frozenset()
     allowed_user_ids: frozenset[str] = frozenset()
 
@@ -55,6 +56,9 @@ class Settings:
             service_account_file=os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE") or None,
             service_account_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or None,
             items_sheet=os.getenv("ITEMS_SHEET", "Items").strip(),
+            reservations_sheet=os.getenv(
+                "RESERVATIONS_SHEET", "Reservations"
+            ).strip(),
             allowed_channel_ids=_csv_set(os.getenv("ALLOWED_CHANNEL_IDS")),
             allowed_user_ids=_csv_set(os.getenv("ALLOWED_USER_IDS")),
         )

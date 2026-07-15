@@ -3,9 +3,11 @@ from unittest import TestCase
 
 from inventory_bot.config import Settings
 from inventory_bot.errors import SheetSchemaError
+from inventory_bot.models import ScheduledReservation
 from inventory_bot.sheets import (
     ITEM_HEADERS,
     LEGACY_ITEM_HEADERS,
+    RESERVATION_HEADERS,
     SCREENSHOT_ITEM_HEADERS,
     GoogleSheetsRepository,
     migrate_item_rows,
@@ -13,9 +15,12 @@ from inventory_bot.sheets import (
 
 
 class RowBackedSheetsRepository(GoogleSheetsRepository):
-    def __init__(self, *, item_rows=None) -> None:
+    def __init__(self, *, item_rows=None, reservation_rows=None) -> None:
         self.settings = Settings(spreadsheet_id="sheet-id")
-        self.rows = {"Items": item_rows or [ITEM_HEADERS]}
+        self.rows = {
+            "Items": item_rows or [ITEM_HEADERS],
+            "Reservations": reservation_rows or [RESERVATION_HEADERS],
+        }
 
     def _get_values(self, sheet_title, **kwargs):
         return self.rows[sheet_title]
@@ -32,6 +37,7 @@ class ExecutableRequest:
 class RecordingValuesApi:
     def __init__(self) -> None:
         self.update_calls = []
+        self.append_calls = []
         self.clear_calls = []
 
     def update(self, **kwargs):
@@ -40,6 +46,10 @@ class RecordingValuesApi:
 
     def clear(self, **kwargs):
         self.clear_calls.append(kwargs)
+        return ExecutableRequest()
+
+    def append(self, **kwargs):
+        self.append_calls.append(kwargs)
         return ExecutableRequest()
 
 
@@ -165,6 +175,108 @@ class GoogleSheetsRepositoryTests(TestCase):
 
         call = repository.service.spreadsheets_api.values_api.clear_calls[0]
         self.assertEqual("'Items'!C2:D2", call["range"])
+
+    def test_parses_scheduled_reservation_rows(self) -> None:
+        repository = RowBackedSheetsRepository(
+            reservation_rows=[
+                RESERVATION_HEADERS,
+                [
+                    "R1",
+                    "kayak1",
+                    "2026-07-15 01:00 PM PDT (UTC-07:00)",
+                    "2026-07-15 03:00 PM PDT (UTC-07:00)",
+                    "Taylor Smith",
+                    "U123",
+                ],
+            ]
+        )
+
+        reservation = repository.list_reservations()[0]
+
+        self.assertEqual("R1", reservation.reservation_id)
+        self.assertEqual(
+            datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+            reservation.start_at_utc,
+        )
+        self.assertEqual(
+            datetime(2026, 7, 15, 22, 0, tzinfo=UTC),
+            reservation.end_at_utc,
+        )
+
+    def test_appends_scheduled_reservation(self) -> None:
+        repository = RowBackedSheetsRepository()
+        repository.service = RecordingService()
+
+        repository.add_reservation(
+            ScheduledReservation(
+                "R1",
+                "kayak1",
+                datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+                datetime(2026, 7, 15, 22, 0, tzinfo=UTC),
+                "Taylor Smith",
+                "U123",
+            )
+        )
+
+        call = repository.service.spreadsheets_api.values_api.append_calls[0]
+        self.assertEqual("'Reservations'!A:F", call["range"])
+        self.assertEqual(
+            [[
+                "R1",
+                "kayak1",
+                "2026-07-15 01:00 PM PDT (UTC-07:00)",
+                "2026-07-15 03:00 PM PDT (UTC-07:00)",
+                "Taylor Smith",
+                "U123",
+            ]],
+            call["body"]["values"],
+        )
+
+    def test_deleting_schedule_clears_only_matching_row(self) -> None:
+        repository = RowBackedSheetsRepository(
+            reservation_rows=[
+                RESERVATION_HEADERS,
+                [
+                    "R1",
+                    "kayak1",
+                    "2026-07-15T20:00:00Z",
+                    "2026-07-15T22:00:00Z",
+                    "Taylor",
+                    "U1",
+                ],
+                [
+                    "R2",
+                    "kayak2",
+                    "2026-07-16T20:00:00Z",
+                    "2026-07-16T22:00:00Z",
+                    "Morgan",
+                    "U2",
+                ],
+            ]
+        )
+        repository.service = RecordingService()
+
+        repository.delete_reservation(reservation_id="R2")
+
+        call = repository.service.spreadsheets_api.values_api.clear_calls[0]
+        self.assertEqual("'Reservations'!A3:F3", call["range"])
+
+    def test_seeds_existing_active_item_into_empty_schedule(self) -> None:
+        repository = RowBackedSheetsRepository(
+            item_rows=[
+                ITEM_HEADERS,
+                ["kayak1", "A", "2099-07-15T22:00:00Z", "Taylor Smith"],
+            ]
+        )
+        repository.service = RecordingService()
+
+        repository._seed_active_item_reservations()
+
+        call = repository.service.spreadsheets_api.values_api.append_calls[0]
+        values = call["body"]["values"][0]
+        self.assertTrue(values[0].startswith("migrated-"))
+        self.assertEqual("kayak1", values[1])
+        self.assertEqual("Taylor Smith", values[4])
 
     def test_migrates_original_six_column_layout(self) -> None:
         migrated = migrate_item_rows(

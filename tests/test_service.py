@@ -3,17 +3,36 @@ from datetime import UTC, datetime, timedelta, timezone
 from unittest import TestCase
 
 from inventory_bot.errors import AmbiguousItemError, AvailabilityError, CancellationError
-from inventory_bot.models import Item
+from inventory_bot.models import Item, ScheduledReservation
 from inventory_bot.service import ReservationService
 
 
 class FakeRepository:
-    def __init__(self, *, items: list[Item]) -> None:
+    def __init__(
+        self,
+        *,
+        items: list[Item],
+        reservations: list[ScheduledReservation] | None = None,
+    ) -> None:
         self.items = items
+        self.reservations = reservations or []
         self.updates: list[tuple[str, datetime, str]] = []
 
     def list_items(self) -> list[Item]:
         return list(self.items)
+
+    def list_reservations(self) -> list[ScheduledReservation]:
+        return list(self.reservations)
+
+    def add_reservation(self, reservation: ScheduledReservation) -> None:
+        self.reservations.append(reservation)
+
+    def delete_reservation(self, *, reservation_id: str) -> None:
+        self.reservations = [
+            reservation
+            for reservation in self.reservations
+            if reservation.reservation_id != reservation_id
+        ]
 
     def update_item_reservation(
         self,
@@ -77,12 +96,19 @@ class ReservationServiceTests(TestCase):
         self.assertEqual(reservation.end_at_utc, updated.reservation_end_utc)
         self.assertEqual("Taylor Smith", updated.reserved_by)
         self.assertEqual(1, len(self.repository.updates))
+        self.assertEqual(self.now, reservation.start_at_utc)
+        self.assertEqual(1, len(self.repository.reservations))
 
     def test_future_end_time_makes_item_unavailable(self) -> None:
-        self.repository.items[0] = replace(
-            self.repository.items[0],
-            reservation_end_utc=self.now + timedelta(hours=1),
-            reserved_by="U999",
+        self.repository.reservations.append(
+            ScheduledReservation(
+                "R1",
+                "kayak1",
+                self.now - timedelta(hours=1),
+                self.now + timedelta(hours=1),
+                "Morgan Jones",
+                "U999",
+            )
         )
 
         statuses = self.service.inventory_status("kayak1")
@@ -99,6 +125,7 @@ class ReservationServiceTests(TestCase):
         statuses = self.service.inventory_status("kayak1")
 
         self.assertTrue(statuses[0].available)
+        self.assertIsNone(self.repository.items[0].reservation_end_utc)
 
     def test_prepare_rejects_currently_reserved_item(self) -> None:
         self.repository.items[0] = replace(
@@ -133,7 +160,7 @@ class ReservationServiceTests(TestCase):
         with self.assertRaises(AmbiguousItemError):
             self.prepare(text="reserve kayak until tomorrow at 3 PM")
 
-    def test_available_items_filters_reserved_items_and_search_text(self) -> None:
+    def test_inventory_picker_includes_items_regardless_of_current_state(self) -> None:
         self.repository.items[1] = replace(
             self.repository.items[1],
             reservation_end_utc=self.now + timedelta(hours=1),
@@ -141,21 +168,22 @@ class ReservationServiceTests(TestCase):
         )
         self.repository.items.append(Item("paddle1", "A"))
 
-        items = self.service.available_items("kay")
+        items = self.service.inventory_items("kay")
 
-        self.assertEqual(["kayak1"], [item.item_name for item in items])
+        self.assertEqual(["kayak1", "kayak2"], [item.item_name for item in items])
 
     def test_reserver_can_cancel_active_reservation(self) -> None:
         prepared = self.prepare()
         self.service.commit(prepared.pending, reserved_by_name="Taylor Smith")
 
-        item = self.service.cancel(
+        reservation = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual("kayak1", item.item_name)
+        self.assertEqual("kayak1", reservation.item_name)
         self.assertIsNone(self.repository.items[0].reservation_end_utc)
         self.assertEqual("", self.repository.items[0].reserved_by)
+        self.assertEqual([], self.repository.reservations)
 
     def test_different_user_cannot_cancel_reservation(self) -> None:
         prepared = self.prepare()
@@ -170,12 +198,128 @@ class ReservationServiceTests(TestCase):
         prepared = self.prepare()
         self.service.commit(prepared.pending)
 
-        item = self.service.cancel(
+        reservation = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual("kayak1", item.item_name)
+        self.assertEqual("kayak1", reservation.item_name)
 
     def test_cannot_cancel_available_item(self) -> None:
-        with self.assertRaisesRegex(CancellationError, "does not have an active"):
+        with self.assertRaisesRegex(CancellationError, "active or upcoming"):
             self.service.cancel("kayak1", requester_user_id="U123")
+
+    def test_future_reservation_does_not_activate_item_early(self) -> None:
+        prepared = self.prepare(
+            text=(
+                "reserve kayak1 from tomorrow at 1 PM "
+                "until tomorrow at 3 PM"
+            )
+        )
+
+        reservation = self.service.commit(
+            prepared.pending, reserved_by_name="Taylor Smith"
+        )
+
+        self.assertGreater(reservation.start_at_utc, self.now)
+        self.assertIsNone(self.repository.items[0].reservation_end_utc)
+        self.assertEqual(1, len(self.repository.reservations))
+
+    def test_overlapping_future_reservation_is_rejected(self) -> None:
+        first = self.prepare(
+            text=(
+                "reserve kayak1 from tomorrow at 1 PM "
+                "until tomorrow at 3 PM"
+            )
+        )
+        self.service.commit(first.pending, reserved_by_name="Taylor Smith")
+
+        with self.assertRaisesRegex(AvailabilityError, "already reserved from"):
+            self.service.prepare(
+                "reserve kayak1 from tomorrow at 2 PM until tomorrow at 4 PM",
+                requester_user_id="U999",
+            )
+
+    def test_commit_rechecks_future_schedule_for_overlap(self) -> None:
+        prepared = self.prepare(
+            text=(
+                "reserve kayak1 from tomorrow at 1 PM "
+                "until tomorrow at 3 PM"
+            )
+        )
+        self.repository.reservations.append(
+            ScheduledReservation(
+                "R-other",
+                "kayak1",
+                prepared.pending.start_at_utc + timedelta(minutes=30),
+                prepared.pending.end_at_utc + timedelta(hours=1),
+                "Morgan Jones",
+                "U999",
+            )
+        )
+
+        with self.assertRaises(AvailabilityError):
+            self.service.commit(prepared.pending, reserved_by_name="Taylor Smith")
+
+    def test_back_to_back_reservations_are_allowed(self) -> None:
+        first = self.prepare(
+            text=(
+                "reserve kayak1 from tomorrow at 1 PM "
+                "until tomorrow at 3 PM"
+            )
+        )
+        self.service.commit(first.pending, reserved_by_name="Taylor Smith")
+        second = self.service.prepare(
+            "reserve kayak1 from tomorrow at 3 PM until tomorrow at 4 PM",
+            requester_user_id="U999",
+        )
+
+        self.service.commit(second.pending, reserved_by_name="Morgan Jones")
+
+        self.assertEqual(2, len(self.repository.reservations))
+
+    def test_reconcile_activates_then_expires_scheduled_reservation(self) -> None:
+        self.repository.reservations.append(
+            ScheduledReservation(
+                "R1",
+                "kayak1",
+                self.now + timedelta(minutes=30),
+                self.now + timedelta(hours=2),
+                "Taylor Smith",
+                "U123",
+            )
+        )
+
+        self.now += timedelta(hours=1)
+        self.service.reconcile()
+
+        self.assertEqual(
+            self.repository.reservations[0].end_at_utc,
+            self.repository.items[0].reservation_end_utc,
+        )
+        self.assertEqual("Taylor Smith", self.repository.items[0].reserved_by)
+
+        self.now += timedelta(hours=2)
+        self.service.reconcile()
+
+        self.assertEqual([], self.repository.reservations)
+        self.assertIsNone(self.repository.items[0].reservation_end_utc)
+
+    def test_cancels_earliest_owned_upcoming_reservation(self) -> None:
+        for index, hours in enumerate((3, 6), start=1):
+            self.repository.reservations.append(
+                ScheduledReservation(
+                    f"R{index}",
+                    "kayak1",
+                    self.now + timedelta(hours=hours),
+                    self.now + timedelta(hours=hours + 1),
+                    "Taylor Smith",
+                    "U123",
+                )
+            )
+
+        cancelled = self.service.cancel(
+            "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
+        )
+
+        self.assertEqual("R1", cancelled.reservation_id)
+        self.assertEqual(["R2"], [value.reservation_id for value in self.repository.reservations])

@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Any
 
 from .config import Settings
 from .errors import ConfigurationError, ItemNotFoundError, SheetSchemaError
-from .models import Item
+from .models import Item, ScheduledReservation
 
 ITEM_HEADERS = ["item_name", "location", "reservation_end", "reserved_by"]
+RESERVATION_HEADERS = [
+    "reservation_id",
+    "item_name",
+    "start_time",
+    "end_time",
+    "reserved_by",
+    "slack_user_id",
+]
 LEGACY_ITEM_HEADERS = [
     "item_id",
     "item_name",
@@ -40,6 +49,8 @@ def _parse_optional_datetime(
     *,
     row_number: int,
     display_timezone: tzinfo,
+    sheet_title: str = "Items",
+    field_name: str = "reservation_end",
 ) -> datetime | None:
     if not value or value == "-":
         return None
@@ -49,7 +60,7 @@ def _parse_optional_datetime(
         match = READABLE_DATETIME_RE.fullmatch(value)
         if not match:
             raise SheetSchemaError(
-                f"Items row {row_number} has an invalid reservation_end: {value!r}. "
+                f"{sheet_title} row {row_number} has an invalid {field_name}: {value!r}. "
                 "Use the bot's local-time format, an ISO timestamp, or leave it blank."
             ) from exc
         local_text = match.group("local").upper()
@@ -65,13 +76,24 @@ def _parse_optional_datetime(
                 ).replace(tzinfo=display_timezone)
         except ValueError as readable_exc:
             raise SheetSchemaError(
-                f"Items row {row_number} has an invalid reservation_end: {value!r}."
+                f"{sheet_title} row {row_number} has an invalid {field_name}: {value!r}."
             ) from readable_exc
     if parsed.tzinfo is None:
         raise SheetSchemaError(
-            f"Items row {row_number} reservation_end must include a timezone."
+            f"{sheet_title} row {row_number} {field_name} must include a timezone."
         )
     return parsed.astimezone(UTC)
+
+
+def _format_sheet_datetime(value: datetime, *, display_timezone: tzinfo) -> str:
+    local_value = value.astimezone(display_timezone)
+    numeric_offset = local_value.strftime("%z") or "+0000"
+    readable_offset = f"{numeric_offset[:3]}:{numeric_offset[3:]}"
+    timezone_label = local_value.tzname() or "UTC"
+    return (
+        f"{local_value.strftime('%Y-%m-%d %I:%M %p')} "
+        f"{timezone_label} (UTC{readable_offset})"
+    )
 
 
 def migrate_item_rows(rows: list[list[Any]]) -> list[list[str]]:
@@ -148,24 +170,38 @@ class GoogleSheetsRepository:
         existing = {
             sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])
         }
-        if self.settings.items_sheet not in existing:
-            (
-                self.service.spreadsheets()
-                .batchUpdate(
-                    spreadsheetId=self.settings.spreadsheet_id,
-                    body={
-                        "requests": [
-                            {
-                                "addSheet": {
-                                    "properties": {"title": self.settings.items_sheet}
+        for sheet_title in (
+            self.settings.items_sheet,
+            self.settings.reservations_sheet,
+        ):
+            if sheet_title not in existing:
+                (
+                    self.service.spreadsheets()
+                    .batchUpdate(
+                        spreadsheetId=self.settings.spreadsheet_id,
+                        body={
+                            "requests": [
+                                {
+                                    "addSheet": {
+                                        "properties": {"title": sheet_title}
+                                    }
                                 }
-                            }
-                        ]
-                    },
+                            ]
+                        },
+                    )
+                    .execute()
                 )
-                .execute()
-            )
-        self._ensure_headers(self.settings.items_sheet, ITEM_HEADERS)
+        self._ensure_headers(
+            self.settings.items_sheet,
+            ITEM_HEADERS,
+            migration_command="inventory-sheet-init --migrate-items",
+        )
+        self._ensure_headers(
+            self.settings.reservations_sheet,
+            RESERVATION_HEADERS,
+            migration_command="inventory-sheet-init --migrate-reservations",
+        )
+        self._seed_active_item_reservations()
 
     def migrate_items_schema(self) -> str | None:
         """Back up and convert a supported old Items tab. Return backup tab name."""
@@ -235,6 +271,76 @@ class GoogleSheetsRepository:
         )
         return backup_name
 
+    def migrate_reservations_schema(self) -> str | None:
+        """Back up an older Reservations tab and initialize the schedule schema."""
+        spreadsheet = self._spreadsheet_metadata()
+        properties = [
+            sheet["properties"]
+            for sheet in spreadsheet.get("sheets", [])
+            if sheet["properties"]["title"] == self.settings.reservations_sheet
+        ]
+        if not properties:
+            self.ensure_schema()
+            return None
+
+        rows = self._get_values(self.settings.reservations_sheet)
+        current_headers = [str(value).strip() for value in rows[0]] if rows else []
+        if current_headers == RESERVATION_HEADERS:
+            return None
+
+        existing_titles = {
+            sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])
+        }
+        base_name = (
+            f"{self.settings.reservations_sheet} Backup "
+            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        )
+        backup_name = base_name
+        counter = 2
+        while backup_name in existing_titles:
+            backup_name = f"{base_name} {counter}"
+            counter += 1
+
+        (
+            self.service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=self.settings.spreadsheet_id,
+                body={
+                    "requests": [
+                        {
+                            "duplicateSheet": {
+                                "sourceSheetId": properties[0]["sheetId"],
+                                "newSheetName": backup_name,
+                            }
+                        }
+                    ]
+                },
+            )
+            .execute()
+        )
+        (
+            self.service.spreadsheets()
+            .values()
+            .clear(
+                spreadsheetId=self.settings.spreadsheet_id,
+                range=f"{_a1_sheet_name(self.settings.reservations_sheet)}!A:Z",
+                body={},
+            )
+            .execute()
+        )
+        (
+            self.service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=self.settings.spreadsheet_id,
+                range=f"{_a1_sheet_name(self.settings.reservations_sheet)}!A1",
+                valueInputOption="RAW",
+                body={"values": [RESERVATION_HEADERS]},
+            )
+            .execute()
+        )
+        return backup_name
+
     def _spreadsheet_metadata(self) -> dict[str, Any]:
         return (
             self.service.spreadsheets()
@@ -245,7 +351,13 @@ class GoogleSheetsRepository:
             .execute()
         )
 
-    def _ensure_headers(self, sheet_title: str, expected: list[str]) -> None:
+    def _ensure_headers(
+        self,
+        sheet_title: str,
+        expected: list[str],
+        *,
+        migration_command: str,
+    ) -> None:
         rows = self._get_values(sheet_title, end_column="Z", end_row=1)
         if not rows or not any(str(value).strip() for value in rows[0]):
             (
@@ -264,7 +376,7 @@ class GoogleSheetsRepository:
         if actual != expected:
             raise SheetSchemaError(
                 f"{sheet_title} headers must be exactly: {', '.join(expected)}. "
-                "Run: inventory-sheet-init --migrate-items"
+                f"Run: {migration_command}"
             )
 
     def list_items(self) -> list[Item]:
@@ -306,6 +418,104 @@ class GoogleSheetsRepository:
             )
         return items
 
+    def list_reservations(self) -> list[ScheduledReservation]:
+        rows = self._get_values(self.settings.reservations_sheet)
+        records = self._records(
+            rows, RESERVATION_HEADERS, self.settings.reservations_sheet
+        )
+        reservations: list[ScheduledReservation] = []
+        for row_number, record in records:
+            missing = [
+                field
+                for field in ("reservation_id", "item_name", "start_time", "end_time")
+                if not record[field]
+            ]
+            if missing:
+                raise SheetSchemaError(
+                    f"{self.settings.reservations_sheet} row {row_number} requires: "
+                    f"{', '.join(missing)}."
+                )
+            start_at = _parse_optional_datetime(
+                record["start_time"],
+                row_number=row_number,
+                display_timezone=self.settings.timezone,
+                sheet_title=self.settings.reservations_sheet,
+                field_name="start_time",
+            )
+            end_at = _parse_optional_datetime(
+                record["end_time"],
+                row_number=row_number,
+                display_timezone=self.settings.timezone,
+                sheet_title=self.settings.reservations_sheet,
+                field_name="end_time",
+            )
+            if start_at is None or end_at is None or end_at <= start_at:
+                raise SheetSchemaError(
+                    f"{self.settings.reservations_sheet} row {row_number} must end "
+                    "after it starts."
+                )
+            reservations.append(
+                ScheduledReservation(
+                    reservation_id=record["reservation_id"],
+                    item_name=record["item_name"],
+                    start_at_utc=start_at,
+                    end_at_utc=end_at,
+                    reserved_by=record["reserved_by"],
+                    slack_user_id=record["slack_user_id"],
+                )
+            )
+
+        ids = [reservation.reservation_id for reservation in reservations]
+        duplicates = sorted({value for value in ids if ids.count(value) > 1})
+        if duplicates:
+            raise SheetSchemaError(
+                f"{self.settings.reservations_sheet} reservation_id values must be "
+                f"unique. Duplicates: {', '.join(duplicates)}."
+            )
+        return reservations
+
+    def add_reservation(self, reservation: ScheduledReservation) -> None:
+        values = [[
+            reservation.reservation_id,
+            reservation.item_name,
+            _format_sheet_datetime(
+                reservation.start_at_utc, display_timezone=self.settings.timezone
+            ),
+            _format_sheet_datetime(
+                reservation.end_at_utc, display_timezone=self.settings.timezone
+            ),
+            reservation.reserved_by,
+            reservation.slack_user_id,
+        ]]
+        (
+            self.service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=self.settings.spreadsheet_id,
+                range=f"{_a1_sheet_name(self.settings.reservations_sheet)}!A:F",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": values},
+            )
+            .execute()
+        )
+
+    def delete_reservation(self, *, reservation_id: str) -> None:
+        row_number = self._reservation_row(reservation_id)
+        (
+            self.service.spreadsheets()
+            .values()
+            .clear(
+                spreadsheetId=self.settings.spreadsheet_id,
+                range=(
+                    f"{_a1_sheet_name(self.settings.reservations_sheet)}!"
+                    f"A{row_number}:F{row_number}"
+                ),
+                body={},
+            )
+            .execute()
+        )
+
     def update_item_reservation(
         self,
         *,
@@ -313,13 +523,8 @@ class GoogleSheetsRepository:
         reservation_end_utc: datetime,
         reserved_by: str,
     ) -> None:
-        local_end = reservation_end_utc.astimezone(self.settings.timezone)
-        numeric_offset = local_end.strftime("%z") or "+0000"
-        readable_offset = f"{numeric_offset[:3]}:{numeric_offset[3:]}"
-        timezone_label = local_end.tzname() or self.settings.timezone_name
-        timestamp = (
-            f"{local_end.strftime('%Y-%m-%d %I:%M %p')} "
-            f"{timezone_label} (UTC{readable_offset})"
+        timestamp = _format_sheet_datetime(
+            reservation_end_utc, display_timezone=self.settings.timezone
         )
         row_number = self._item_row(item_name)
         (
@@ -361,6 +566,46 @@ class GoogleSheetsRepository:
                 f"Expected one Items row for {item_name!r}; found {len(matches)}."
             )
         return matches[0]
+
+    def _reservation_row(self, reservation_id: str) -> int:
+        rows = self._get_values(self.settings.reservations_sheet)
+        records = self._records(
+            rows, RESERVATION_HEADERS, self.settings.reservations_sheet
+        )
+        matches = [
+            row_number
+            for row_number, record in records
+            if record["reservation_id"] == reservation_id
+        ]
+        if len(matches) != 1:
+            raise ItemNotFoundError(
+                f"Expected one Reservations row for {reservation_id!r}; "
+                f"found {len(matches)}."
+            )
+        return matches[0]
+
+    def _seed_active_item_reservations(self) -> None:
+        if self.list_reservations():
+            return
+        now = datetime.now(tz=UTC)
+        for item in self.list_items():
+            if item.reservation_end_utc is None or item.reservation_end_utc <= now:
+                continue
+            slack_user_id = (
+                item.reserved_by
+                if re.fullmatch(r"[UW][A-Z0-9]+", item.reserved_by)
+                else ""
+            )
+            self.add_reservation(
+                ScheduledReservation(
+                    reservation_id=f"migrated-{uuid.uuid4()}",
+                    item_name=item.item_name,
+                    start_at_utc=now,
+                    end_at_utc=item.reservation_end_utc,
+                    reserved_by=item.reserved_by,
+                    slack_user_id=slack_user_id,
+                )
+            )
 
     def _get_values(
         self,

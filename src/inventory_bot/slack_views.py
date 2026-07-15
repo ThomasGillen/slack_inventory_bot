@@ -15,6 +15,14 @@ RESERVATION_MODAL_CALLBACK = "reservation_modal"
 OPEN_RESERVATION_ACTION = "open_reservation_modal"
 ITEM_BLOCK = "reservation_item"
 ITEM_ACTION = "reservation_item_select"
+START_MODE_BLOCK = "reservation_start_mode"
+START_MODE_ACTION = "reservation_start_mode_select"
+START_NOW_VALUE = "now"
+START_SCHEDULED_VALUE = "scheduled"
+START_DATE_BLOCK = "reservation_start_date"
+START_DATE_ACTION = "reservation_start_date_select"
+START_TIME_BLOCK = "reservation_start_time"
+START_TIME_ACTION = "reservation_start_time_select"
 DATE_BLOCK = "reservation_date"
 DATE_ACTION = "reservation_date_select"
 TIME_BLOCK = "reservation_time"
@@ -51,13 +59,13 @@ class ModalInputError(ParseError):
 
 
 def reservation_launcher_message() -> tuple[str, list[dict[str, Any]]]:
-    text = "Open the reservation form to choose an item and end time."
+    text = "Open the reservation form to choose an item and reservation timing."
     return text, [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "*Reserve an item*\nChoose an available item and its reservation end time.",
+                "text": "*Reserve an item*\nChoose an item, whether to start now, and its end time.",
             },
         },
         {
@@ -82,7 +90,19 @@ def build_reservation_modal(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     local_now = (now or datetime.now(tz=UTC)).astimezone(settings.timezone)
-    initial_date = (local_now.date() + timedelta(days=1)).isoformat()
+    rounded_now = local_now.replace(second=0, microsecond=0)
+    initial_start = rounded_now + timedelta(
+        minutes=15 - (rounded_now.minute % 15)
+    )
+    initial_end = initial_start + timedelta(hours=1)
+    start_now_option = {
+        "text": {"type": "plain_text", "text": "Start now"},
+        "value": START_NOW_VALUE,
+    }
+    scheduled_option = {
+        "text": {"type": "plain_text", "text": "Schedule for later"},
+        "value": START_SCHEDULED_VALUE,
+    }
     return {
         "type": "modal",
         "callback_id": RESERVATION_MODAL_CALLBACK,
@@ -107,22 +127,60 @@ def build_reservation_modal(
             },
             {
                 "type": "input",
+                "block_id": START_MODE_BLOCK,
+                "label": {"type": "plain_text", "text": "Reservation start"},
+                "hint": {
+                    "type": "plain_text",
+                    "text": (
+                        "Scheduled start fields below are ignored when Start now "
+                        "is selected."
+                    ),
+                },
+                "element": {
+                    "type": "radio_buttons",
+                    "action_id": START_MODE_ACTION,
+                    "options": [start_now_option, scheduled_option],
+                    "initial_option": start_now_option,
+                },
+            },
+            {
+                "type": "input",
+                "block_id": START_DATE_BLOCK,
+                "label": {"type": "plain_text", "text": "Scheduled start date"},
+                "element": {
+                    "type": "datepicker",
+                    "action_id": START_DATE_ACTION,
+                    "initial_date": initial_start.date().isoformat(),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": START_TIME_BLOCK,
+                "label": {"type": "plain_text", "text": "Scheduled start time"},
+                "element": {
+                    "type": "timepicker",
+                    "action_id": START_TIME_ACTION,
+                    "initial_time": initial_start.strftime("%H:%M"),
+                },
+            },
+            {
+                "type": "input",
                 "block_id": DATE_BLOCK,
-                "label": {"type": "plain_text", "text": "Reservation end date"},
+                "label": {"type": "plain_text", "text": "End date"},
                 "element": {
                     "type": "datepicker",
                     "action_id": DATE_ACTION,
-                    "initial_date": initial_date,
+                    "initial_date": initial_end.date().isoformat(),
                 },
             },
             {
                 "type": "input",
                 "block_id": TIME_BLOCK,
-                "label": {"type": "plain_text", "text": "Reservation end time"},
+                "label": {"type": "plain_text", "text": "End time"},
                 "element": {
                     "type": "timepicker",
                     "action_id": TIME_ACTION,
-                    "initial_time": "17:00",
+                    "initial_time": initial_end.strftime("%H:%M"),
                 },
             },
             {
@@ -161,10 +219,50 @@ def parse_modal_submission(
     now: datetime | None = None,
 ) -> PendingReservation:
     values = view.get("state", {}).get("values", {})
+    current = now or datetime.now(tz=UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    current_utc = current.astimezone(UTC)
     try:
         item_name = values[ITEM_BLOCK][ITEM_ACTION]["selected_option"]["value"]
     except (KeyError, TypeError):
         raise ModalInputError(ITEM_BLOCK, "Choose an inventory item.") from None
+
+    try:
+        start_mode = values[START_MODE_BLOCK][START_MODE_ACTION][
+            "selected_option"
+        ]["value"]
+    except (KeyError, TypeError):
+        # A modal opened immediately before this upgrade has no start-mode field.
+        start_mode = START_SCHEDULED_VALUE
+
+    if start_mode == START_NOW_VALUE:
+        start_utc = current_utc
+    elif start_mode == START_SCHEDULED_VALUE:
+        try:
+            selected_start_date = values[START_DATE_BLOCK][START_DATE_ACTION][
+                "selected_date"
+            ]
+            start_date = date.fromisoformat(selected_start_date)
+        except (KeyError, TypeError, ValueError):
+            raise ModalInputError(
+                START_DATE_BLOCK, "Choose a valid scheduled start date."
+            ) from None
+        try:
+            selected_start_time = values[START_TIME_BLOCK][START_TIME_ACTION][
+                "selected_time"
+            ]
+            start_time = time.fromisoformat(selected_start_time)
+        except (KeyError, TypeError, ValueError):
+            raise ModalInputError(
+                START_TIME_BLOCK, "Choose a valid scheduled start time."
+            ) from None
+        start_utc = datetime.combine(
+            start_date, start_time, tzinfo=settings.timezone
+        ).astimezone(UTC)
+    else:
+        raise ModalInputError(START_MODE_BLOCK, "Choose when the reservation starts.")
+
     try:
         selected_date = values[DATE_BLOCK][DATE_ACTION]["selected_date"]
         end_date = date.fromisoformat(selected_date)
@@ -177,14 +275,16 @@ def parse_modal_submission(
         raise ModalInputError(TIME_BLOCK, "Choose a valid end time.") from None
 
     end_local = datetime.combine(end_date, end_time, tzinfo=settings.timezone)
-    current = now or datetime.now(tz=UTC)
-    if current.tzinfo is None:
-        current = current.replace(tzinfo=UTC)
-    if end_local.astimezone(UTC) <= current.astimezone(UTC):
+    if start_utc < current_utc:
+        raise ModalInputError(START_TIME_BLOCK, "Reservation start cannot be in the past.")
+    if end_local.astimezone(UTC) <= current_utc:
         raise ModalInputError(TIME_BLOCK, "Reservation end must be in the future.")
+    if end_local.astimezone(UTC) <= start_utc:
+        raise ModalInputError(TIME_BLOCK, "Reservation end must be after its start.")
 
     return PendingReservation(
         item_name=str(item_name),
+        start_at_utc=start_utc,
         end_at_utc=end_local.astimezone(UTC),
         requester_user_id=requester_user_id,
     )

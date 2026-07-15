@@ -91,14 +91,16 @@ def create_app(
             item_query = command_without_mention.split(maxsplit=1)[1]
             try:
                 requester_name = _slack_user_name(client, user_id)
-                item = service.cancel(
+                reservation = service.cancel(
                     item_query,
                     requester_user_id=user_id,
                     requester_name=requester_name,
                 )
                 text_response = (
                     f":white_check_mark: Reservation cancelled for "
-                    f"*{_escape_mrkdwn(item.item_name)}*. It is now available."
+                    f"*{_escape_mrkdwn(reservation.item_name)}* from "
+                    f"{_escape_mrkdwn(_format_end_time(reservation.start_at_utc, settings))} "
+                    f"until {_escape_mrkdwn(_format_end_time(reservation.end_at_utc, settings))}."
                 )
             except InventoryBotError as exc:
                 text_response = f":warning: {exc}"
@@ -193,7 +195,7 @@ def create_app(
             return
         try:
             query = str(payload.get("value", ""))
-            ack(options=item_options(service.available_items(query)))
+            ack(options=item_options(service.inventory_items(query)))
         except Exception:
             LOGGER.exception("Unable to load available inventory options")
             ack(options=[])
@@ -341,6 +343,7 @@ def create_app(
                 text=str(exc),
             )
 
+    setattr(app, "_inventory_service", service)
     return app
 
 
@@ -385,10 +388,16 @@ def confirmation_message(
 ) -> tuple[str, list[dict[str, Any]]]:
     item_name = _escape_mrkdwn(prepared.item.item_name)
     location = _escape_mrkdwn(prepared.item.location or "Not specified")
+    start_text = (
+        _format_end_time(prepared.pending.start_at_utc, settings)
+        if prepared.pending.start_at_utc is not None
+        else "Immediately after confirmation"
+    )
     end_text = _format_end_time(prepared.pending.end_at_utc, settings)
     value = prepared.pending.to_action_value()
     text = (
-        f"Confirm reservation for {prepared.item.item_name}, ending {end_text}."
+        f"Confirm reservation for {prepared.item.item_name} from {start_text} "
+        f"until {end_text}."
     )
     blocks = [
         {
@@ -399,6 +408,7 @@ def confirmation_message(
                     f"*Confirm reservation*\n"
                     f"*Item:* {item_name}\n"
                     f"*Location:* {location}\n"
+                    f"*Starts:* {_escape_mrkdwn(start_text)}\n"
                     f"*Ends:* {_escape_mrkdwn(end_text)}"
                 ),
             },
@@ -428,9 +438,11 @@ def confirmation_message(
 def committed_message(
     reservation: Reservation, settings: Settings
 ) -> tuple[str, list[dict[str, Any]]]:
+    start_text = _format_end_time(reservation.start_at_utc, settings)
     end_text = _format_end_time(reservation.end_at_utc, settings)
     text = (
-        f"Reservation confirmed for {reservation.item_name} until {end_text}."
+        f"Reservation confirmed for {reservation.item_name} from {start_text} "
+        f"until {end_text}."
     )
     return text, [
         {
@@ -441,6 +453,7 @@ def committed_message(
                     f":white_check_mark: *Reservation confirmed*\n"
                     f"*Item:* {_escape_mrkdwn(reservation.item_name)}\n"
                     f"*Location:* {_escape_mrkdwn(reservation.location or 'Not specified')}\n"
+                    f"*Starts:* {_escape_mrkdwn(start_text)}\n"
                     f"*Ends:* {_escape_mrkdwn(end_text)}"
                 ),
             },
@@ -464,6 +477,22 @@ def status_text(
         )
         if status.available:
             state = "available"
+            if status.next_reservation is not None:
+                next_start = _format_end_time(
+                    status.next_reservation.start_at_utc, settings
+                )
+                next_end = _format_end_time(
+                    status.next_reservation.end_at_utc, settings
+                )
+                owner = (
+                    f" by {_escape_mrkdwn(status.next_reservation.reserved_by)}"
+                    if status.next_reservation.reserved_by
+                    else ""
+                )
+                state += (
+                    f" now; next reserved from {_escape_mrkdwn(next_start)} "
+                    f"until {_escape_mrkdwn(next_end)}{owner}"
+                )
         else:
             end_text = _format_end_time(status.item.reservation_end_utc, settings)
             reserved_by = status.item.reserved_by
@@ -484,11 +513,12 @@ def help_text() -> str:
     return (
         "*Inventory Bot commands*\n"
         "• `reserve` — open the reservation form\n"
-        "• `reserve <item> until <date and time>`\n"
+        "• `reserve <item> from <date/time> until <date/time>`\n"
+        "• `reserve <item> until <date/time>` — start immediately\n"
         "• `cancel <item>`\n"
         "• `status` or `status <item>`\n\n"
         "Examples:\n"
-        "`reserve kayak1 until Friday at 3 PM`\n"
+        "`reserve kayak1 from Friday at 1 PM until Friday at 3 PM`\n"
         "`reserve kayak2 until 2026-07-18 17:00`"
     )
 
