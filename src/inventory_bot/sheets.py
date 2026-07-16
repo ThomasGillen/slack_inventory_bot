@@ -14,8 +14,17 @@ from .errors import ConfigurationError, ItemNotFoundError, SheetSchemaError
 from .models import Item, ScheduledReservation
 
 ITEM_HEADERS = ["item_name", "location", "reservation_end", "reserved_by"]
+PRE_GROUP_RESERVATION_HEADERS = [
+    "reservation_id",
+    "item_name",
+    "start_time",
+    "end_time",
+    "reserved_by",
+    "slack_user_id",
+]
 RESERVATION_HEADERS = [
     "reservation_id",
+    "group_id",
     "item_name",
     "start_time",
     "end_time",
@@ -42,6 +51,10 @@ READABLE_DATETIME_RE = re.compile(
 
 def _a1_sheet_name(title: str) -> str:
     return "'" + title.replace("'", "''") + "'"
+
+
+def _normalized_name(value: str) -> str:
+    return " ".join(value.casefold().split())
 
 
 def _parse_optional_datetime(
@@ -125,6 +138,44 @@ def migrate_item_rows(rows: list[list[Any]]) -> list[list[str]]:
         if reservation_end == "-":
             reservation_end = ""
         migrated.append([item_name, location, reservation_end, ""])
+    return migrated
+
+
+def migrate_reservation_rows(rows: list[list[Any]]) -> list[list[str]]:
+    """Add group IDs while preserving rows from the single-item schedule."""
+    if not rows:
+        return [RESERVATION_HEADERS]
+    headers = [str(value).strip() for value in rows[0]]
+    if headers == RESERVATION_HEADERS:
+        return [[str(value) for value in row] for row in rows]
+    if headers != PRE_GROUP_RESERVATION_HEADERS:
+        return [RESERVATION_HEADERS]
+
+    migrated: list[list[str]] = [RESERVATION_HEADERS]
+    for row in rows[1:]:
+        padded = [str(value).strip() for value in row] + [""] * (
+            len(PRE_GROUP_RESERVATION_HEADERS) - len(row)
+        )
+        record = dict(
+            zip(
+                PRE_GROUP_RESERVATION_HEADERS,
+                padded[: len(PRE_GROUP_RESERVATION_HEADERS)],
+                strict=True,
+            )
+        )
+        if not any(record.values()):
+            continue
+        migrated.append(
+            [
+                record["reservation_id"],
+                record["reservation_id"],
+                record["item_name"],
+                record["start_time"],
+                record["end_time"],
+                record["reserved_by"],
+                record["slack_user_id"],
+            ]
+        )
     return migrated
 
 
@@ -287,6 +338,7 @@ class GoogleSheetsRepository:
         current_headers = [str(value).strip() for value in rows[0]] if rows else []
         if current_headers == RESERVATION_HEADERS:
             return None
+        migrated_rows = migrate_reservation_rows(rows)
 
         existing_titles = {
             sheet["properties"]["title"] for sheet in spreadsheet.get("sheets", [])
@@ -335,7 +387,7 @@ class GoogleSheetsRepository:
                 spreadsheetId=self.settings.spreadsheet_id,
                 range=f"{_a1_sheet_name(self.settings.reservations_sheet)}!A1",
                 valueInputOption="RAW",
-                body={"values": [RESERVATION_HEADERS]},
+                body={"values": migrated_rows},
             )
             .execute()
         )
@@ -427,7 +479,13 @@ class GoogleSheetsRepository:
         for row_number, record in records:
             missing = [
                 field
-                for field in ("reservation_id", "item_name", "start_time", "end_time")
+                for field in (
+                    "reservation_id",
+                    "group_id",
+                    "item_name",
+                    "start_time",
+                    "end_time",
+                )
                 if not record[field]
             ]
             if missing:
@@ -462,6 +520,7 @@ class GoogleSheetsRepository:
                     end_at_utc=end_at,
                     reserved_by=record["reserved_by"],
                     slack_user_id=record["slack_user_id"],
+                    group_id=record["group_id"],
                 )
             )
 
@@ -474,25 +533,35 @@ class GoogleSheetsRepository:
             )
         return reservations
 
-    def add_reservation(self, reservation: ScheduledReservation) -> None:
-        values = [[
-            reservation.reservation_id,
-            reservation.item_name,
-            _format_sheet_datetime(
-                reservation.start_at_utc, display_timezone=self.settings.timezone
-            ),
-            _format_sheet_datetime(
-                reservation.end_at_utc, display_timezone=self.settings.timezone
-            ),
-            reservation.reserved_by,
-            reservation.slack_user_id,
-        ]]
+    def add_reservations(
+        self, reservations: list[ScheduledReservation]
+    ) -> None:
+        if not reservations:
+            return
+        values = [
+            [
+                reservation.reservation_id,
+                reservation.group_id or reservation.reservation_id,
+                reservation.item_name,
+                _format_sheet_datetime(
+                    reservation.start_at_utc,
+                    display_timezone=self.settings.timezone,
+                ),
+                _format_sheet_datetime(
+                    reservation.end_at_utc,
+                    display_timezone=self.settings.timezone,
+                ),
+                reservation.reserved_by,
+                reservation.slack_user_id,
+            ]
+            for reservation in reservations
+        ]
         (
             self.service.spreadsheets()
             .values()
             .append(
                 spreadsheetId=self.settings.spreadsheet_id,
-                range=f"{_a1_sheet_name(self.settings.reservations_sheet)}!A:F",
+                range=f"{_a1_sheet_name(self.settings.reservations_sheet)}!A:G",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": values},
@@ -500,94 +569,131 @@ class GoogleSheetsRepository:
             .execute()
         )
 
-    def delete_reservation(self, *, reservation_id: str) -> None:
-        row_number = self._reservation_row(reservation_id)
+    def delete_reservations(self, *, reservation_ids: list[str]) -> None:
+        if not reservation_ids:
+            return
+        row_numbers = self._reservation_rows(reservation_ids)
+        ranges = [
+            (
+                f"{_a1_sheet_name(self.settings.reservations_sheet)}!"
+                f"A{row_numbers[reservation_id]}:G{row_numbers[reservation_id]}"
+            )
+            for reservation_id in reservation_ids
+        ]
         (
             self.service.spreadsheets()
             .values()
-            .clear(
+            .batchClear(
                 spreadsheetId=self.settings.spreadsheet_id,
-                range=(
-                    f"{_a1_sheet_name(self.settings.reservations_sheet)}!"
-                    f"A{row_number}:F{row_number}"
-                ),
-                body={},
+                body={"ranges": ranges},
             )
             .execute()
         )
 
-    def update_item_reservation(
-        self,
-        *,
-        item_name: str,
-        reservation_end_utc: datetime,
-        reserved_by: str,
+    def update_item_reservations(
+        self, reservations: list[ScheduledReservation]
     ) -> None:
-        timestamp = _format_sheet_datetime(
-            reservation_end_utc, display_timezone=self.settings.timezone
+        if not reservations:
+            return
+        row_numbers = self._item_rows(
+            [reservation.item_name for reservation in reservations]
         )
-        row_number = self._item_row(item_name)
+        data = [
+            {
+                "range": (
+                    f"{_a1_sheet_name(self.settings.items_sheet)}!"
+                    f"C{row_numbers[_normalized_name(reservation.item_name)]}:"
+                    f"D{row_numbers[_normalized_name(reservation.item_name)]}"
+                ),
+                "values": [[
+                    _format_sheet_datetime(
+                        reservation.end_at_utc,
+                        display_timezone=self.settings.timezone,
+                    ),
+                    reservation.reserved_by,
+                ]],
+            }
+            for reservation in reservations
+        ]
         (
             self.service.spreadsheets()
             .values()
-            .update(
+            .batchUpdate(
                 spreadsheetId=self.settings.spreadsheet_id,
-                range=f"{_a1_sheet_name(self.settings.items_sheet)}!C{row_number}:D{row_number}",
-                valueInputOption="RAW",
-                body={"values": [[timestamp, reserved_by]]},
+                body={"valueInputOption": "RAW", "data": data},
             )
             .execute()
         )
 
-    def clear_item_reservation(self, *, item_name: str) -> None:
-        row_number = self._item_row(item_name)
+    def clear_item_reservations(self, *, item_names: list[str]) -> None:
+        if not item_names:
+            return
+        row_numbers = self._item_rows(item_names)
+        ranges = [
+            (
+                f"{_a1_sheet_name(self.settings.items_sheet)}!"
+                f"C{row_numbers[_normalized_name(item_name)]}:"
+                f"D{row_numbers[_normalized_name(item_name)]}"
+            )
+            for item_name in item_names
+        ]
         (
             self.service.spreadsheets()
             .values()
-            .clear(
+            .batchClear(
                 spreadsheetId=self.settings.spreadsheet_id,
-                range=f"{_a1_sheet_name(self.settings.items_sheet)}!C{row_number}:D{row_number}",
-                body={},
+                body={"ranges": ranges},
             )
             .execute()
         )
 
-    def _item_row(self, item_name: str) -> int:
+    def _item_rows(self, item_names: list[str]) -> dict[str, int]:
         rows = self._get_values(self.settings.items_sheet)
         records = self._records(rows, ITEM_HEADERS, self.settings.items_sheet)
-        needle = " ".join(item_name.casefold().split())
-        matches = [
-            row_number
+        rows_by_name = {
+            _normalized_name(record["item_name"]): row_number
             for row_number, record in records
-            if " ".join(record["item_name"].casefold().split()) == needle
+        }
+        requested = [_normalized_name(item_name) for item_name in item_names]
+        missing = [
+            item_name
+            for item_name, normalized in zip(item_names, requested, strict=True)
+            if normalized not in rows_by_name
         ]
-        if len(matches) != 1:
+        if missing:
             raise ItemNotFoundError(
-                f"Expected one Items row for {item_name!r}; found {len(matches)}."
+                f"Missing Items rows for: {', '.join(missing)}."
             )
-        return matches[0]
+        return {normalized: rows_by_name[normalized] for normalized in requested}
 
-    def _reservation_row(self, reservation_id: str) -> int:
+    def _reservation_rows(self, reservation_ids: list[str]) -> dict[str, int]:
         rows = self._get_values(self.settings.reservations_sheet)
         records = self._records(
             rows, RESERVATION_HEADERS, self.settings.reservations_sheet
         )
-        matches = [
-            row_number
+        rows_by_id = {
+            record["reservation_id"]: row_number
             for row_number, record in records
-            if record["reservation_id"] == reservation_id
+        }
+        missing = [
+            reservation_id
+            for reservation_id in reservation_ids
+            if reservation_id not in rows_by_id
         ]
-        if len(matches) != 1:
+        if missing:
             raise ItemNotFoundError(
-                f"Expected one Reservations row for {reservation_id!r}; "
-                f"found {len(matches)}."
+                f"Missing Reservations rows for: {', '.join(missing)}."
             )
-        return matches[0]
+        return {
+            reservation_id: rows_by_id[reservation_id]
+            for reservation_id in reservation_ids
+        }
 
     def _seed_active_item_reservations(self) -> None:
         if self.list_reservations():
             return
         now = datetime.now(tz=UTC)
+        reservations: list[ScheduledReservation] = []
         for item in self.list_items():
             if item.reservation_end_utc is None or item.reservation_end_utc <= now:
                 continue
@@ -596,16 +702,19 @@ class GoogleSheetsRepository:
                 if re.fullmatch(r"[UW][A-Z0-9]+", item.reserved_by)
                 else ""
             )
-            self.add_reservation(
+            reservation_id = f"migrated-{uuid.uuid4()}"
+            reservations.append(
                 ScheduledReservation(
-                    reservation_id=f"migrated-{uuid.uuid4()}",
+                    reservation_id=reservation_id,
                     item_name=item.item_name,
                     start_at_utc=now,
                     end_at_utc=item.reservation_end_utc,
                     reserved_by=item.reserved_by,
                     slack_user_id=slack_user_id,
+                    group_id=reservation_id,
                 )
             )
+        self.add_reservations(reservations)
 
     def _get_values(
         self,
@@ -638,9 +747,14 @@ class GoogleSheetsRepository:
             )
         actual_headers = [str(value).strip() for value in rows[0]]
         if actual_headers != expected_headers:
+            migration_flag = (
+                "--migrate-reservations"
+                if "reservation_id" in expected_headers
+                else "--migrate-items"
+            )
             raise SheetSchemaError(
-                f"{sheet_title} headers do not match the expected four-column schema. "
-                "Run: inventory-sheet-init --migrate-items"
+                f"{sheet_title} headers do not match the expected schema. "
+                f"Run: inventory-sheet-init {migration_flag}"
             )
 
         records: list[tuple[int, dict[str, str]]] = []

@@ -9,6 +9,7 @@ from inventory_bot.models import (
     PendingReservation,
     PreparedReservation,
     Reservation,
+    ReservationGroup,
     ScheduledReservation,
 )
 from inventory_bot.slack_app import (
@@ -28,14 +29,14 @@ class SlackMessageTests(TestCase):
     def test_confirmation_uses_unique_item_fields_without_quantity(self) -> None:
         item = Item("kayak1", "A")
         pending = PendingReservation(
-            item_name="kayak1",
+            item_names=("kayak1",),
             start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
             end_at_utc=self.end,
             requester_user_id="U123",
         )
 
         text, blocks = confirmation_message(
-            PreparedReservation(item=item, pending=pending),
+            PreparedReservation(items=(item,), pending=pending),
             self.settings,
         )
 
@@ -64,7 +65,7 @@ class SlackMessageTests(TestCase):
 
     def test_new_button_payload_contains_only_required_fields(self) -> None:
         pending = PendingReservation(
-            "kayak1",
+            ("kayak1", "kayak2"),
             self.end,
             "U123",
             datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
@@ -73,7 +74,8 @@ class SlackMessageTests(TestCase):
         payload = json.loads(pending.to_action_value())
 
         self.assertEqual({"v", "n", "b", "e", "u"}, set(payload))
-        self.assertEqual(4, payload["v"])
+        self.assertEqual(5, payload["v"])
+        self.assertEqual(["kayak1", "kayak2"], payload["n"])
 
     def test_committed_message_contains_item_and_end_time(self) -> None:
         reservation = Reservation(
@@ -84,11 +86,34 @@ class SlackMessageTests(TestCase):
             end_at_utc=self.end,
         )
 
-        text, blocks = committed_message(reservation, self.settings)
+        text, blocks = committed_message(
+            ReservationGroup("G1", (reservation,)), self.settings
+        )
 
         self.assertIn("kayak1", text)
         self.assertIn("kayak1", str(blocks))
         self.assertIn("Starts", str(blocks))
+
+    def test_multi_item_confirmation_lists_every_item(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+            end_at_utc=self.end,
+            requester_user_id="U123",
+        )
+
+        text, blocks = confirmation_message(
+            PreparedReservation(
+                items=(Item("kayak1", "A"), Item("kayak2", "B")),
+                pending=pending,
+            ),
+            self.settings,
+        )
+
+        self.assertIn("kayak1, kayak2", text)
+        self.assertIn("Items (2)", str(blocks))
+        self.assertIn("kayak1", str(blocks))
+        self.assertIn("kayak2", str(blocks))
 
     def test_status_shows_current_owner_and_end_time(self) -> None:
         item = Item("kayak1", "A", self.end, "U123")

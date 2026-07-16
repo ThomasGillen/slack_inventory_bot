@@ -24,6 +24,25 @@ class Reservation:
     location: str
     start_at_utc: datetime
     end_at_utc: datetime
+    group_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ReservationGroup:
+    group_id: str
+    reservations: tuple[Reservation, ...]
+
+    @property
+    def start_at_utc(self) -> datetime:
+        return self.reservations[0].start_at_utc
+
+    @property
+    def end_at_utc(self) -> datetime:
+        return self.reservations[0].end_at_utc
+
+    @property
+    def item_names(self) -> tuple[str, ...]:
+        return tuple(reservation.item_name for reservation in self.reservations)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +53,7 @@ class ScheduledReservation:
     end_at_utc: datetime
     reserved_by: str
     slack_user_id: str
+    group_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,20 +65,23 @@ class ParsedReservation:
 
 @dataclass(frozen=True, slots=True)
 class PendingReservation:
-    item_name: str
+    item_names: tuple[str, ...]
     end_at_utc: datetime
     requester_user_id: str
     start_at_utc: datetime | None = None
 
+    @property
+    def item_name(self) -> str:
+        return self.item_names[0]
+
     def to_action_value(self) -> str:
         payload = {
-            "v": 3,
-            "n": self.item_name,
+            "v": 5,
+            "n": list(self.item_names),
             "e": self.end_at_utc.isoformat(),
             "u": self.requester_user_id,
         }
         if self.start_at_utc is not None:
-            payload["v"] = 4
             payload["b"] = self.start_at_utc.isoformat()
         value = json.dumps(payload, separators=(",", ":"))
         if len(value) > 1900:
@@ -70,19 +93,26 @@ class PendingReservation:
         try:
             payload = json.loads(value)
             version = payload.get("v")
-            if version not in {1, 2, 3, 4}:
+            if version not in {1, 2, 3, 4, 5}:
                 raise ValueError("unsupported version")
             end_at = datetime.fromisoformat(payload["e"].replace("Z", "+00:00"))
             if end_at.tzinfo is None:
                 raise ValueError("end time is missing a timezone")
             start_at = None
-            if version == 4:
+            if version in {4, 5} and payload.get("b"):
                 start_at = datetime.fromisoformat(payload["b"].replace("Z", "+00:00"))
                 if start_at.tzinfo is None:
                     raise ValueError("start time is missing a timezone")
-            item_name = payload["i"] if version == 1 else payload["n"]
+            if version == 5:
+                raw_names = payload["n"]
+                if not isinstance(raw_names, list) or not raw_names:
+                    raise ValueError("item list is missing")
+                item_names = tuple(str(name) for name in raw_names)
+            else:
+                item_name = payload["i"] if version == 1 else payload["n"]
+                item_names = (str(item_name),)
             return cls(
-                item_name=str(item_name),
+                item_names=item_names,
                 end_at_utc=end_at,
                 requester_user_id=str(payload["u"]),
                 start_at_utc=start_at,
@@ -93,8 +123,12 @@ class PendingReservation:
 
 @dataclass(frozen=True, slots=True)
 class PreparedReservation:
-    item: Item
+    items: tuple[Item, ...]
     pending: PendingReservation
+
+    @property
+    def item(self) -> Item:
+        return self.items[0]
 
 
 @dataclass(frozen=True, slots=True)

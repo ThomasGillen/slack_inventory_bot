@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import Settings
@@ -15,18 +15,10 @@ RESERVATION_MODAL_CALLBACK = "reservation_modal"
 OPEN_RESERVATION_ACTION = "open_reservation_modal"
 ITEM_BLOCK = "reservation_item"
 ITEM_ACTION = "reservation_item_select"
-START_MODE_BLOCK = "reservation_start_mode"
-START_MODE_ACTION = "reservation_start_mode_select"
-START_NOW_VALUE = "now"
-START_SCHEDULED_VALUE = "scheduled"
-START_DATE_BLOCK = "reservation_start_date"
-START_DATE_ACTION = "reservation_start_date_select"
-START_TIME_BLOCK = "reservation_start_time"
-START_TIME_ACTION = "reservation_start_time_select"
-DATE_BLOCK = "reservation_date"
-DATE_ACTION = "reservation_date_select"
-TIME_BLOCK = "reservation_time"
-TIME_ACTION = "reservation_time_select"
+START_BLOCK = "reservation_start"
+START_ACTION = "reservation_start_select"
+END_BLOCK = "reservation_end"
+END_ACTION = "reservation_end_select"
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,13 +51,13 @@ class ModalInputError(ParseError):
 
 
 def reservation_launcher_message() -> tuple[str, list[dict[str, Any]]]:
-    text = "Open the reservation form to choose an item and reservation timing."
+    text = "Open the reservation form to choose items and reservation timing."
     return text, [
         {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "*Reserve an item*\nChoose an item, whether to start now, and its end time.",
+                "text": "*Reserve items*\nChoose up to 10 items, whether to start now, and the end time.",
             },
         },
         {
@@ -89,98 +81,54 @@ def build_reservation_modal(
     destination: ModalDestination = ModalDestination(),
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    local_now = (now or datetime.now(tz=UTC)).astimezone(settings.timezone)
-    rounded_now = local_now.replace(second=0, microsecond=0)
-    initial_start = rounded_now + timedelta(
-        minutes=15 - (rounded_now.minute % 15)
-    )
+    current = now or datetime.now(tz=UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    initial_start = current.astimezone(UTC).replace(second=0, microsecond=0)
     initial_end = initial_start + timedelta(hours=1)
-    start_now_option = {
-        "text": {"type": "plain_text", "text": "Start now"},
-        "value": START_NOW_VALUE,
-    }
-    scheduled_option = {
-        "text": {"type": "plain_text", "text": "Schedule for later"},
-        "value": START_SCHEDULED_VALUE,
-    }
+    metadata = json.loads(destination.to_json())
+    metadata["default_start"] = int(initial_start.timestamp())
     return {
         "type": "modal",
         "callback_id": RESERVATION_MODAL_CALLBACK,
-        "private_metadata": destination.to_json(),
-        "title": {"type": "plain_text", "text": "Reserve an item"},
+        "private_metadata": json.dumps(metadata, separators=(",", ":")),
+        "title": {"type": "plain_text", "text": "Reserve items"},
         "submit": {"type": "plain_text", "text": "Reserve"},
         "close": {"type": "plain_text", "text": "Cancel"},
         "blocks": [
             {
                 "type": "input",
                 "block_id": ITEM_BLOCK,
-                "label": {"type": "plain_text", "text": "Item"},
+                "label": {"type": "plain_text", "text": "Items"},
                 "element": {
-                    "type": "external_select",
+                    "type": "multi_external_select",
                     "action_id": ITEM_ACTION,
                     "min_query_length": 0,
+                    "max_selected_items": 10,
                     "placeholder": {
                         "type": "plain_text",
-                        "text": "Choose or search available items",
+                        "text": "Choose up to 10 items",
                     },
                 },
             },
             {
                 "type": "input",
-                "block_id": START_MODE_BLOCK,
-                "label": {"type": "plain_text", "text": "Reservation start"},
-                "hint": {
-                    "type": "plain_text",
-                    "text": (
-                        "Scheduled start fields below are ignored when Start now "
-                        "is selected."
-                    ),
-                },
+                "block_id": START_BLOCK,
+                "label": {"type": "plain_text", "text": "Start"},
                 "element": {
-                    "type": "radio_buttons",
-                    "action_id": START_MODE_ACTION,
-                    "options": [start_now_option, scheduled_option],
-                    "initial_option": start_now_option,
+                    "type": "datetimepicker",
+                    "action_id": START_ACTION,
+                    "initial_date_time": int(initial_start.timestamp()),
                 },
             },
             {
                 "type": "input",
-                "block_id": START_DATE_BLOCK,
-                "label": {"type": "plain_text", "text": "Scheduled start date"},
+                "block_id": END_BLOCK,
+                "label": {"type": "plain_text", "text": "End"},
                 "element": {
-                    "type": "datepicker",
-                    "action_id": START_DATE_ACTION,
-                    "initial_date": initial_start.date().isoformat(),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": START_TIME_BLOCK,
-                "label": {"type": "plain_text", "text": "Scheduled start time"},
-                "element": {
-                    "type": "timepicker",
-                    "action_id": START_TIME_ACTION,
-                    "initial_time": initial_start.strftime("%H:%M"),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": DATE_BLOCK,
-                "label": {"type": "plain_text", "text": "End date"},
-                "element": {
-                    "type": "datepicker",
-                    "action_id": DATE_ACTION,
-                    "initial_date": initial_end.date().isoformat(),
-                },
-            },
-            {
-                "type": "input",
-                "block_id": TIME_BLOCK,
-                "label": {"type": "plain_text", "text": "End time"},
-                "element": {
-                    "type": "timepicker",
-                    "action_id": TIME_ACTION,
-                    "initial_time": initial_end.strftime("%H:%M"),
+                    "type": "datetimepicker",
+                    "action_id": END_ACTION,
+                    "initial_date_time": int(initial_end.timestamp()),
                 },
             },
             {
@@ -188,7 +136,10 @@ def build_reservation_modal(
                 "elements": [
                     {
                         "type": "mrkdwn",
-                        "text": f"Date and time are interpreted in *{settings.timezone_name}*.",
+                        "text": (
+                            "Slack displays picker values in your local timezone. "
+                            f"Confirmations and sheet times use *{settings.timezone_name}*."
+                        ),
                     }
                 ],
             },
@@ -224,67 +175,69 @@ def parse_modal_submission(
         current = current.replace(tzinfo=UTC)
     current_utc = current.astimezone(UTC)
     try:
-        item_name = values[ITEM_BLOCK][ITEM_ACTION]["selected_option"]["value"]
+        selected_options = values[ITEM_BLOCK][ITEM_ACTION]["selected_options"]
+        item_names = tuple(str(option["value"]) for option in selected_options)
     except (KeyError, TypeError):
-        raise ModalInputError(ITEM_BLOCK, "Choose an inventory item.") from None
+        raise ModalInputError(ITEM_BLOCK, "Choose at least one inventory item.") from None
+    if not item_names:
+        raise ModalInputError(ITEM_BLOCK, "Choose at least one inventory item.")
+    if len(item_names) > 10:
+        raise ModalInputError(ITEM_BLOCK, "Choose no more than 10 inventory items.")
+    if len({_normalized_item_name(name) for name in item_names}) != len(item_names):
+        raise ModalInputError(ITEM_BLOCK, "Choose each inventory item only once.")
 
-    try:
-        start_mode = values[START_MODE_BLOCK][START_MODE_ACTION][
-            "selected_option"
-        ]["value"]
-    except (KeyError, TypeError):
-        # A modal opened immediately before this upgrade has no start-mode field.
-        start_mode = START_SCHEDULED_VALUE
+    start_utc, start_timestamp = _parse_datetimepicker(
+        values,
+        block_id=START_BLOCK,
+        action_id=START_ACTION,
+        label="start",
+    )
+    end_utc, _ = _parse_datetimepicker(
+        values,
+        block_id=END_BLOCK,
+        action_id=END_ACTION,
+        label="end",
+    )
 
-    if start_mode == START_NOW_VALUE:
+    if start_timestamp == _default_start_timestamp(view):
         start_utc = current_utc
-    elif start_mode == START_SCHEDULED_VALUE:
-        try:
-            selected_start_date = values[START_DATE_BLOCK][START_DATE_ACTION][
-                "selected_date"
-            ]
-            start_date = date.fromisoformat(selected_start_date)
-        except (KeyError, TypeError, ValueError):
-            raise ModalInputError(
-                START_DATE_BLOCK, "Choose a valid scheduled start date."
-            ) from None
-        try:
-            selected_start_time = values[START_TIME_BLOCK][START_TIME_ACTION][
-                "selected_time"
-            ]
-            start_time = time.fromisoformat(selected_start_time)
-        except (KeyError, TypeError, ValueError):
-            raise ModalInputError(
-                START_TIME_BLOCK, "Choose a valid scheduled start time."
-            ) from None
-        start_utc = datetime.combine(
-            start_date, start_time, tzinfo=settings.timezone
-        ).astimezone(UTC)
-    else:
-        raise ModalInputError(START_MODE_BLOCK, "Choose when the reservation starts.")
-
-    try:
-        selected_date = values[DATE_BLOCK][DATE_ACTION]["selected_date"]
-        end_date = date.fromisoformat(selected_date)
-    except (KeyError, TypeError, ValueError):
-        raise ModalInputError(DATE_BLOCK, "Choose a valid end date.") from None
-    try:
-        selected_time = values[TIME_BLOCK][TIME_ACTION]["selected_time"]
-        end_time = time.fromisoformat(selected_time)
-    except (KeyError, TypeError, ValueError):
-        raise ModalInputError(TIME_BLOCK, "Choose a valid end time.") from None
-
-    end_local = datetime.combine(end_date, end_time, tzinfo=settings.timezone)
-    if start_utc < current_utc:
-        raise ModalInputError(START_TIME_BLOCK, "Reservation start cannot be in the past.")
-    if end_local.astimezone(UTC) <= current_utc:
-        raise ModalInputError(TIME_BLOCK, "Reservation end must be in the future.")
-    if end_local.astimezone(UTC) <= start_utc:
-        raise ModalInputError(TIME_BLOCK, "Reservation end must be after its start.")
+    elif start_utc < current_utc:
+        raise ModalInputError(START_BLOCK, "Reservation start cannot be in the past.")
+    if end_utc <= current_utc:
+        raise ModalInputError(END_BLOCK, "Reservation end must be in the future.")
+    if end_utc <= start_utc:
+        raise ModalInputError(END_BLOCK, "Reservation end must be after its start.")
 
     return PendingReservation(
-        item_name=str(item_name),
+        item_names=item_names,
         start_at_utc=start_utc,
-        end_at_utc=end_local.astimezone(UTC),
+        end_at_utc=end_utc,
         requester_user_id=requester_user_id,
     )
+
+
+def _normalized_item_name(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _parse_datetimepicker(
+    values: dict[str, Any],
+    *,
+    block_id: str,
+    action_id: str,
+    label: str,
+) -> tuple[datetime, int]:
+    try:
+        timestamp = int(values[block_id][action_id]["selected_date_time"])
+        selected = datetime.fromtimestamp(timestamp, tz=UTC)
+    except (KeyError, TypeError, ValueError, OSError, OverflowError):
+        raise ModalInputError(block_id, f"Choose a valid reservation {label}.") from None
+    return selected, timestamp
+
+
+def _default_start_timestamp(view: dict[str, Any]) -> int | None:
+    try:
+        metadata = json.loads(str(view.get("private_metadata", "")) or "{}")
+        return int(metadata["default_start"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None

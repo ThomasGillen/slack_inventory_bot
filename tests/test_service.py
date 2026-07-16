@@ -2,8 +2,13 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from unittest import TestCase
 
-from inventory_bot.errors import AmbiguousItemError, AvailabilityError, CancellationError
-from inventory_bot.models import Item, ScheduledReservation
+from inventory_bot.errors import (
+    AmbiguousItemError,
+    AvailabilityError,
+    CancellationError,
+    ParseError,
+)
+from inventory_bot.models import Item, PendingReservation, ScheduledReservation
 from inventory_bot.service import ReservationService
 
 
@@ -17,6 +22,10 @@ class FakeRepository:
         self.items = items
         self.reservations = reservations or []
         self.updates: list[tuple[str, datetime, str]] = []
+        self.add_batches: list[list[ScheduledReservation]] = []
+        self.delete_batches: list[list[str]] = []
+        self.update_batches: list[list[ScheduledReservation]] = []
+        self.clear_batches: list[list[str]] = []
 
     def list_items(self) -> list[Item]:
         return list(self.items)
@@ -24,44 +33,55 @@ class FakeRepository:
     def list_reservations(self) -> list[ScheduledReservation]:
         return list(self.reservations)
 
-    def add_reservation(self, reservation: ScheduledReservation) -> None:
-        self.reservations.append(reservation)
+    def add_reservations(self, reservations: list[ScheduledReservation]) -> None:
+        self.add_batches.append(list(reservations))
+        self.reservations.extend(reservations)
 
-    def delete_reservation(self, *, reservation_id: str) -> None:
+    def delete_reservations(self, *, reservation_ids: list[str]) -> None:
+        self.delete_batches.append(list(reservation_ids))
+        ids = set(reservation_ids)
         self.reservations = [
             reservation
             for reservation in self.reservations
-            if reservation.reservation_id != reservation_id
+            if reservation.reservation_id not in ids
         ]
 
-    def update_item_reservation(
-        self,
-        *,
-        item_name: str,
-        reservation_end_utc: datetime,
-        reserved_by: str,
+    def update_item_reservations(
+        self, reservations: list[ScheduledReservation]
     ) -> None:
-        for index, item in enumerate(self.items):
-            if item.item_name.casefold() == item_name.casefold():
-                self.items[index] = replace(
-                    item,
-                    reservation_end_utc=reservation_end_utc,
-                    reserved_by=reserved_by,
-                )
-                self.updates.append((item_name, reservation_end_utc, reserved_by))
-                return
-        raise AssertionError(f"Missing fake item: {item_name}")
+        self.update_batches.append(list(reservations))
+        for reservation in reservations:
+            for index, item in enumerate(self.items):
+                if item.item_name.casefold() == reservation.item_name.casefold():
+                    self.items[index] = replace(
+                        item,
+                        reservation_end_utc=reservation.end_at_utc,
+                        reserved_by=reservation.reserved_by,
+                    )
+                    self.updates.append(
+                        (
+                            reservation.item_name,
+                            reservation.end_at_utc,
+                            reservation.reserved_by,
+                        )
+                    )
+                    break
+            else:
+                raise AssertionError(f"Missing fake item: {reservation.item_name}")
 
-    def clear_item_reservation(self, *, item_name: str) -> None:
-        for index, item in enumerate(self.items):
-            if item.item_name.casefold() == item_name.casefold():
-                self.items[index] = replace(
-                    item,
-                    reservation_end_utc=None,
-                    reserved_by="",
-                )
-                return
-        raise AssertionError(f"Missing fake item: {item_name}")
+    def clear_item_reservations(self, *, item_names: list[str]) -> None:
+        self.clear_batches.append(list(item_names))
+        for item_name in item_names:
+            for index, item in enumerate(self.items):
+                if item.item_name.casefold() == item_name.casefold():
+                    self.items[index] = replace(
+                        item,
+                        reservation_end_utc=None,
+                        reserved_by="",
+                    )
+                    break
+            else:
+                raise AssertionError(f"Missing fake item: {item_name}")
 
 
 class ReservationServiceTests(TestCase):
@@ -91,8 +111,8 @@ class ReservationServiceTests(TestCase):
         )
 
         updated = self.repository.items[0]
-        self.assertEqual("kayak1", reservation.item_name)
-        self.assertEqual("A", reservation.location)
+        self.assertEqual(("kayak1",), reservation.item_names)
+        self.assertEqual("A", reservation.reservations[0].location)
         self.assertEqual(reservation.end_at_utc, updated.reservation_end_utc)
         self.assertEqual("Taylor Smith", updated.reserved_by)
         self.assertEqual(1, len(self.repository.updates))
@@ -180,7 +200,7 @@ class ReservationServiceTests(TestCase):
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual("kayak1", reservation.item_name)
+        self.assertEqual(("kayak1",), reservation.item_names)
         self.assertIsNone(self.repository.items[0].reservation_end_utc)
         self.assertEqual("", self.repository.items[0].reserved_by)
         self.assertEqual([], self.repository.reservations)
@@ -202,7 +222,7 @@ class ReservationServiceTests(TestCase):
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual("kayak1", reservation.item_name)
+        self.assertEqual(("kayak1",), reservation.item_names)
 
     def test_cannot_cancel_available_item(self) -> None:
         with self.assertRaisesRegex(CancellationError, "active or upcoming"):
@@ -321,5 +341,88 @@ class ReservationServiceTests(TestCase):
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual("R1", cancelled.reservation_id)
+        self.assertEqual("R1", cancelled.reservations[0].reservation_id)
         self.assertEqual(["R2"], [value.reservation_id for value in self.repository.reservations])
+
+    def test_multi_item_commit_is_grouped_and_batched(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+
+        reservation_group = self.service.commit(
+            pending, reserved_by_name="Taylor Smith"
+        )
+
+        self.assertEqual(("kayak1", "kayak2"), reservation_group.item_names)
+        self.assertEqual(2, len(reservation_group.reservations))
+        self.assertTrue(reservation_group.group_id)
+        self.assertEqual(
+            {reservation_group.group_id},
+            {value.group_id for value in self.repository.reservations},
+        )
+        self.assertEqual(1, len(self.repository.add_batches))
+        self.assertEqual(1, len(self.repository.update_batches))
+        self.assertEqual(2, len(self.repository.add_batches[0]))
+        self.assertEqual(2, len(self.repository.update_batches[0]))
+        self.assertTrue(all(item.reservation_end_utc for item in self.repository.items))
+
+    def test_multi_item_conflict_rejects_entire_group(self) -> None:
+        existing = ScheduledReservation(
+            "R-existing",
+            "kayak2",
+            self.now,
+            self.now + timedelta(hours=2),
+            "Morgan Jones",
+            "U999",
+            "G-existing",
+        )
+        self.repository.reservations.append(existing)
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=1),
+            requester_user_id="U123",
+        )
+
+        with self.assertRaisesRegex(AvailabilityError, "kayak2"):
+            self.service.commit(pending, reserved_by_name="Taylor Smith")
+
+        self.assertEqual([existing], self.repository.reservations)
+        self.assertEqual([], self.repository.add_batches)
+        self.assertEqual([], self.repository.update_batches)
+
+    def test_multi_item_commit_limits_group_to_ten_items(self) -> None:
+        pending = PendingReservation(
+            item_names=tuple(f"item-{index}" for index in range(11)),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=1),
+            requester_user_id="U123",
+        )
+
+        with self.assertRaisesRegex(ParseError, "no more than 10"):
+            self.service.commit(pending)
+
+        self.assertEqual([], self.repository.add_batches)
+
+    def test_cancel_one_item_cancels_its_whole_group(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+        committed = self.service.commit(pending, reserved_by_name="Taylor Smith")
+
+        cancelled = self.service.cancel(
+            "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
+        )
+
+        self.assertEqual(committed.group_id, cancelled.group_id)
+        self.assertEqual(("kayak1", "kayak2"), cancelled.item_names)
+        self.assertEqual([], self.repository.reservations)
+        self.assertEqual(1, len(self.repository.delete_batches))
+        self.assertEqual(2, len(self.repository.delete_batches[0]))
+        self.assertTrue(all(item.reservation_end_utc is None for item in self.repository.items))

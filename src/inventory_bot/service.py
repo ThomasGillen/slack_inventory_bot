@@ -20,6 +20,7 @@ from .models import (
     PendingReservation,
     PreparedReservation,
     Reservation,
+    ReservationGroup,
     ScheduledReservation,
 )
 from .parser import parse_reservation_message
@@ -64,23 +65,25 @@ class ReservationService:
             raise AvailabilityError(self._reserved_message(item))
 
         pending = PendingReservation(
-            item_name=item.item_name,
+            item_names=(item.item_name,),
             start_at_utc=parsed.start_at_utc,
             end_at_utc=parsed.end_at_utc,
             requester_user_id=requester_user_id,
         )
         self._assert_no_overlap(item, pending, now, self.repository.list_reservations())
-        return PreparedReservation(item=item, pending=pending)
+        return PreparedReservation(items=(item,), pending=pending)
 
     def commit(
         self,
         pending: PendingReservation,
         *,
         reserved_by_name: str | None = None,
-    ) -> Reservation:
+    ) -> ReservationGroup:
         with self._write_lock:
             now = self._now()
-            item = self._item_by_name(pending.item_name, self.repository.list_items())
+            items = self._items_by_name(
+                pending.item_names, self.repository.list_items()
+            )
             if pending.end_at_utc <= now:
                 raise ParseError("The reservation end time has already passed.")
             start_at = (pending.start_at_utc or now).astimezone(UTC)
@@ -91,36 +94,48 @@ class ReservationService:
 
             reservations = self._remove_expired(now)
             normalized_pending = PendingReservation(
-                item_name=item.item_name,
+                item_names=tuple(item.item_name for item in items),
                 start_at_utc=start_at,
                 end_at_utc=pending.end_at_utc.astimezone(UTC),
                 requester_user_id=pending.requester_user_id,
             )
-            self._assert_no_overlap(item, normalized_pending, now, reservations)
-
-            scheduled = ScheduledReservation(
-                reservation_id=str(uuid.uuid4()),
-                item_name=item.item_name,
-                start_at_utc=start_at,
-                end_at_utc=pending.end_at_utc.astimezone(UTC),
-                reserved_by=" ".join(
-                    (reserved_by_name or pending.requester_user_id).split()
-                ),
-                slack_user_id=pending.requester_user_id,
-            )
-            self.repository.add_reservation(scheduled)
-            if start_at <= now:
-                self.repository.update_item_reservation(
-                    item_name=item.item_name,
-                    reservation_end_utc=scheduled.end_at_utc,
-                    reserved_by=scheduled.reserved_by,
+            for item in items:
+                self._assert_no_overlap(
+                    item, normalized_pending, now, reservations
                 )
-            return Reservation(
-                reservation_id=scheduled.reservation_id,
-                item_name=item.item_name,
-                location=item.location,
-                start_at_utc=scheduled.start_at_utc,
-                end_at_utc=scheduled.end_at_utc,
+
+            group_id = str(uuid.uuid4())
+            owner_name = " ".join(
+                (reserved_by_name or pending.requester_user_id).split()
+            )
+            scheduled = [
+                ScheduledReservation(
+                    reservation_id=str(uuid.uuid4()),
+                    item_name=item.item_name,
+                    start_at_utc=start_at,
+                    end_at_utc=pending.end_at_utc.astimezone(UTC),
+                    reserved_by=owner_name,
+                    slack_user_id=pending.requester_user_id,
+                    group_id=group_id,
+                )
+                for item in items
+            ]
+            self.repository.add_reservations(scheduled)
+            if start_at <= now:
+                self.repository.update_item_reservations(scheduled)
+            return ReservationGroup(
+                group_id=group_id,
+                reservations=tuple(
+                    Reservation(
+                        reservation_id=value.reservation_id,
+                        item_name=item.item_name,
+                        location=item.location,
+                        start_at_utc=value.start_at_utc,
+                        end_at_utc=value.end_at_utc,
+                        group_id=group_id,
+                    )
+                    for item, value in zip(items, scheduled, strict=True)
+                ),
             )
 
     def reconcile(self) -> None:
@@ -170,17 +185,19 @@ class ReservationService:
         *,
         requester_user_id: str,
         requester_name: str = "",
-    ) -> Reservation:
+    ) -> ReservationGroup:
         with self._write_lock:
             now = self._now()
-            item = self._resolve_item(item_query, self.repository.list_items())
+            items = self.repository.list_items()
+            item = self._resolve_item(item_query, items)
             owners = {_normalized(requester_user_id)}
             if requester_name:
                 owners.add(_normalized(requester_name))
 
+            all_reservations = self._remove_expired(now)
             reservations = [
                 reservation
-                for reservation in self._remove_expired(now)
+                for reservation in all_reservations
                 if _normalized(reservation.item_name) == _normalized(item.item_name)
                 and reservation.end_at_utc > now
             ]
@@ -193,16 +210,46 @@ class ReservationService:
             if owned:
                 active = [reservation for reservation in owned if reservation.start_at_utc <= now]
                 selected = min(active or owned, key=lambda value: value.start_at_utc)
-                self.repository.delete_reservation(
-                    reservation_id=selected.reservation_id
+                group_id = selected.group_id or selected.reservation_id
+                group_rows = [
+                    reservation
+                    for reservation in all_reservations
+                    if (reservation.group_id or reservation.reservation_id) == group_id
+                ]
+                if not all(
+                    reservation.slack_user_id == requester_user_id
+                    or _normalized(reservation.reserved_by) in owners
+                    for reservation in group_rows
+                ):
+                    raise CancellationError(
+                        "This reservation group has inconsistent ownership in the sheet."
+                    )
+                self.repository.delete_reservations(
+                    reservation_ids=[
+                        reservation.reservation_id for reservation in group_rows
+                    ]
                 )
                 self._reconcile_locked(now)
-                return Reservation(
-                    reservation_id=selected.reservation_id,
-                    item_name=item.item_name,
-                    location=item.location,
-                    start_at_utc=selected.start_at_utc,
-                    end_at_utc=selected.end_at_utc,
+                locations_by_name = {
+                    _normalized(value.item_name): value.location for value in items
+                }
+                return ReservationGroup(
+                    group_id=group_id,
+                    reservations=tuple(
+                        Reservation(
+                            reservation_id=reservation.reservation_id,
+                            item_name=reservation.item_name,
+                            location=locations_by_name.get(
+                                _normalized(reservation.item_name), ""
+                            ),
+                            start_at_utc=reservation.start_at_utc,
+                            end_at_utc=reservation.end_at_utc,
+                            group_id=group_id,
+                        )
+                        for reservation in sorted(
+                            group_rows, key=lambda value: value.item_name.casefold()
+                        )
+                    ),
                 )
 
             if reservations:
@@ -222,13 +269,18 @@ class ReservationService:
                 raise CancellationError(
                     f"Only the person who reserved {item.item_name} can cancel it."
                 )
-            self.repository.clear_item_reservation(item_name=item.item_name)
-            return Reservation(
-                reservation_id="",
-                item_name=item.item_name,
-                location=item.location,
-                start_at_utc=now,
-                end_at_utc=item.reservation_end_utc,
+            self.repository.clear_item_reservations(item_names=[item.item_name])
+            return ReservationGroup(
+                group_id="",
+                reservations=(
+                    Reservation(
+                        reservation_id="",
+                        item_name=item.item_name,
+                        location=item.location,
+                        start_at_utc=now,
+                        end_at_utc=item.reservation_end_utc,
+                    ),
+                ),
             )
 
     def _now(self) -> datetime:
@@ -288,19 +340,24 @@ class ReservationService:
 
     def _remove_expired(self, now: datetime) -> list[ScheduledReservation]:
         reservations = self.repository.list_reservations()
-        active_or_future: list[ScheduledReservation] = []
-        for reservation in reservations:
-            if reservation.end_at_utc <= now:
-                self.repository.delete_reservation(
-                    reservation_id=reservation.reservation_id
-                )
-            else:
-                active_or_future.append(reservation)
-        return active_or_future
+        expired_ids = [
+            reservation.reservation_id
+            for reservation in reservations
+            if reservation.end_at_utc <= now
+        ]
+        if expired_ids:
+            self.repository.delete_reservations(reservation_ids=expired_ids)
+        return [
+            reservation
+            for reservation in reservations
+            if reservation.end_at_utc > now
+        ]
 
     def _reconcile_locked(self, now: datetime) -> None:
         reservations = self._remove_expired(now)
         items = self.repository.list_items()
+        updates: list[ScheduledReservation] = []
+        clears: list[str] = []
         for item in items:
             active = [
                 reservation
@@ -318,13 +375,26 @@ class ReservationService:
                     item.reservation_end_utc != reservation.end_at_utc
                     or item.reserved_by != reservation.reserved_by
                 ):
-                    self.repository.update_item_reservation(
-                        item_name=item.item_name,
-                        reservation_end_utc=reservation.end_at_utc,
-                        reserved_by=reservation.reserved_by,
-                    )
+                    updates.append(reservation)
             elif item.reservation_end_utc is not None or item.reserved_by:
-                self.repository.clear_item_reservation(item_name=item.item_name)
+                clears.append(item.item_name)
+        if updates:
+            self.repository.update_item_reservations(updates)
+        if clears:
+            self.repository.clear_item_reservations(item_names=clears)
+
+    @classmethod
+    def _items_by_name(
+        cls, item_names: tuple[str, ...], items: list[Item]
+    ) -> tuple[Item, ...]:
+        if not item_names:
+            raise ParseError("Choose at least one inventory item.")
+        if len(item_names) > 10:
+            raise ParseError("Choose no more than 10 inventory items.")
+        normalized_names = [_normalized(name) for name in item_names]
+        if len(set(normalized_names)) != len(normalized_names):
+            raise ParseError("Choose each inventory item only once.")
+        return tuple(cls._item_by_name(name, items) for name in item_names)
 
     @staticmethod
     def _item_by_name(item_name: str, items: list[Item]) -> Item:

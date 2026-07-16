@@ -14,7 +14,7 @@ from .models import (
     InventoryAvailability,
     PendingReservation,
     PreparedReservation,
-    Reservation,
+    ReservationGroup,
 )
 from .repository import InventoryRepository
 from .service import ReservationService
@@ -91,16 +91,17 @@ def create_app(
             item_query = command_without_mention.split(maxsplit=1)[1]
             try:
                 requester_name = _slack_user_name(client, user_id)
-                reservation = service.cancel(
+                reservation_group = service.cancel(
                     item_query,
                     requester_user_id=user_id,
                     requester_name=requester_name,
                 )
+                item_names = ", ".join(reservation_group.item_names)
                 text_response = (
                     f":white_check_mark: Reservation cancelled for "
-                    f"*{_escape_mrkdwn(reservation.item_name)}* from "
-                    f"{_escape_mrkdwn(_format_end_time(reservation.start_at_utc, settings))} "
-                    f"until {_escape_mrkdwn(_format_end_time(reservation.end_at_utc, settings))}."
+                    f"*{_escape_mrkdwn(item_names)}* from "
+                    f"{_escape_mrkdwn(_format_end_time(reservation_group.start_at_utc, settings))} "
+                    f"until {_escape_mrkdwn(_format_end_time(reservation_group.end_at_utc, settings))}."
                 )
             except InventoryBotError as exc:
                 text_response = f":warning: {exc}"
@@ -386,8 +387,8 @@ def _escape_mrkdwn(value: str) -> str:
 def confirmation_message(
     prepared: PreparedReservation, settings: Settings
 ) -> tuple[str, list[dict[str, Any]]]:
-    item_name = _escape_mrkdwn(prepared.item.item_name)
-    location = _escape_mrkdwn(prepared.item.location or "Not specified")
+    item_names = ", ".join(item.item_name for item in prepared.items)
+    item_lines = _format_prepared_items(prepared)
     start_text = (
         _format_end_time(prepared.pending.start_at_utc, settings)
         if prepared.pending.start_at_utc is not None
@@ -396,7 +397,7 @@ def confirmation_message(
     end_text = _format_end_time(prepared.pending.end_at_utc, settings)
     value = prepared.pending.to_action_value()
     text = (
-        f"Confirm reservation for {prepared.item.item_name} from {start_text} "
+        f"Confirm reservation for {item_names} from {start_text} "
         f"until {end_text}."
     )
     blocks = [
@@ -406,8 +407,7 @@ def confirmation_message(
                 "type": "mrkdwn",
                 "text": (
                     f"*Confirm reservation*\n"
-                    f"*Item:* {item_name}\n"
-                    f"*Location:* {location}\n"
+                    f"*Items ({len(prepared.items)}):*\n{item_lines}\n"
                     f"*Starts:* {_escape_mrkdwn(start_text)}\n"
                     f"*Ends:* {_escape_mrkdwn(end_text)}"
                 ),
@@ -436,12 +436,20 @@ def confirmation_message(
 
 
 def committed_message(
-    reservation: Reservation, settings: Settings
+    reservation_group: ReservationGroup, settings: Settings
 ) -> tuple[str, list[dict[str, Any]]]:
-    start_text = _format_end_time(reservation.start_at_utc, settings)
-    end_text = _format_end_time(reservation.end_at_utc, settings)
+    start_text = _format_end_time(reservation_group.start_at_utc, settings)
+    end_text = _format_end_time(reservation_group.end_at_utc, settings)
+    item_names = ", ".join(reservation_group.item_names)
+    item_lines = "\n".join(
+        (
+            f"• *{_escape_mrkdwn(reservation.item_name)}* — "
+            f"{_escape_mrkdwn(reservation.location or 'Location not specified')}"
+        )
+        for reservation in reservation_group.reservations
+    )
     text = (
-        f"Reservation confirmed for {reservation.item_name} from {start_text} "
+        f"Reservation confirmed for {item_names} from {start_text} "
         f"until {end_text}."
     )
     return text, [
@@ -451,14 +459,23 @@ def committed_message(
                 "type": "mrkdwn",
                 "text": (
                     f":white_check_mark: *Reservation confirmed*\n"
-                    f"*Item:* {_escape_mrkdwn(reservation.item_name)}\n"
-                    f"*Location:* {_escape_mrkdwn(reservation.location or 'Not specified')}\n"
+                    f"*Items ({len(reservation_group.reservations)}):*\n{item_lines}\n"
                     f"*Starts:* {_escape_mrkdwn(start_text)}\n"
                     f"*Ends:* {_escape_mrkdwn(end_text)}"
                 ),
             },
         }
     ]
+
+
+def _format_prepared_items(prepared: PreparedReservation) -> str:
+    return "\n".join(
+        (
+            f"• *{_escape_mrkdwn(item.item_name)}* — "
+            f"{_escape_mrkdwn(item.location or 'Location not specified')}"
+        )
+        for item in prepared.items
+    )
 
 
 def status_text(

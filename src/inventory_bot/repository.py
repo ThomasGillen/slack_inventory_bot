@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Protocol
 
 from .models import Item, ScheduledReservation
@@ -13,16 +12,14 @@ class InventoryRepository(Protocol):
 
     def list_reservations(self) -> list[ScheduledReservation]: ...
 
-    def add_reservation(self, reservation: ScheduledReservation) -> None: ...
-
-    def delete_reservation(self, *, reservation_id: str) -> None: ...
-
-    def update_item_reservation(
-        self,
-        *,
-        item_name: str,
-        reservation_end_utc: datetime,
-        reserved_by: str,
+    def add_reservations(
+        self, reservations: list[ScheduledReservation]
     ) -> None: ...
 
-    def clear_item_reservation(self, *, item_name: str) -> None: ...
+    def delete_reservations(self, *, reservation_ids: list[str]) -> None: ...
+
+    def update_item_reservations(
+        self, reservations: list[ScheduledReservation]
+    ) -> None: ...
+
+    def clear_item_reservations(self, *, item_names: list[str]) -> None: ...

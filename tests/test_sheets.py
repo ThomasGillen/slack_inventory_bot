@@ -7,10 +7,12 @@ from inventory_bot.models import ScheduledReservation
 from inventory_bot.sheets import (
     ITEM_HEADERS,
     LEGACY_ITEM_HEADERS,
+    PRE_GROUP_RESERVATION_HEADERS,
     RESERVATION_HEADERS,
     SCREENSHOT_ITEM_HEADERS,
     GoogleSheetsRepository,
     migrate_item_rows,
+    migrate_reservation_rows,
 )
 
 
@@ -39,6 +41,8 @@ class RecordingValuesApi:
         self.update_calls = []
         self.append_calls = []
         self.clear_calls = []
+        self.batch_update_calls = []
+        self.batch_clear_calls = []
 
     def update(self, **kwargs):
         self.update_calls.append(kwargs)
@@ -50,6 +54,14 @@ class RecordingValuesApi:
 
     def append(self, **kwargs):
         self.append_calls.append(kwargs)
+        return ExecutableRequest()
+
+    def batchUpdate(self, **kwargs):
+        self.batch_update_calls.append(kwargs)
+        return ExecutableRequest()
+
+    def batchClear(self, **kwargs):
+        self.batch_clear_calls.append(kwargs)
         return ExecutableRequest()
 
 
@@ -149,17 +161,27 @@ class GoogleSheetsRepositoryTests(TestCase):
         )
         repository.service = RecordingService()
 
-        repository.update_item_reservation(
-            item_name="KAYAK1",
-            reservation_end_utc=datetime(2026, 7, 15, 22, 0, tzinfo=UTC),
-            reserved_by="U123",
+        repository.update_item_reservations(
+            [
+                ScheduledReservation(
+                    "R1",
+                    "KAYAK1",
+                    datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+                    datetime(2026, 7, 15, 22, 0, tzinfo=UTC),
+                    "U123",
+                    "U123",
+                    "G1",
+                )
+            ]
         )
 
-        call = repository.service.spreadsheets_api.values_api.update_calls[0]
-        self.assertEqual("'Items'!C2:D2", call["range"])
+        call = repository.service.spreadsheets_api.values_api.batch_update_calls[0]
         self.assertEqual(
-            [["2026-07-15 03:00 PM PDT (UTC-07:00)", "U123"]],
-            call["body"]["values"],
+            {
+                "range": "'Items'!C2:D2",
+                "values": [["2026-07-15 03:00 PM PDT (UTC-07:00)", "U123"]],
+            },
+            call["body"]["data"][0],
         )
 
     def test_cancellation_clears_only_current_reservation_cells(self) -> None:
@@ -171,10 +193,10 @@ class GoogleSheetsRepositoryTests(TestCase):
         )
         repository.service = RecordingService()
 
-        repository.clear_item_reservation(item_name="kayak1")
+        repository.clear_item_reservations(item_names=["kayak1"])
 
-        call = repository.service.spreadsheets_api.values_api.clear_calls[0]
-        self.assertEqual("'Items'!C2:D2", call["range"])
+        call = repository.service.spreadsheets_api.values_api.batch_clear_calls[0]
+        self.assertEqual(["'Items'!C2:D2"], call["body"]["ranges"])
 
     def test_parses_scheduled_reservation_rows(self) -> None:
         repository = RowBackedSheetsRepository(
@@ -182,6 +204,7 @@ class GoogleSheetsRepositoryTests(TestCase):
                 RESERVATION_HEADERS,
                 [
                     "R1",
+                    "G1",
                     "kayak1",
                     "2026-07-15 01:00 PM PDT (UTC-07:00)",
                     "2026-07-15 03:00 PM PDT (UTC-07:00)",
@@ -194,6 +217,7 @@ class GoogleSheetsRepositoryTests(TestCase):
         reservation = repository.list_reservations()[0]
 
         self.assertEqual("R1", reservation.reservation_id)
+        self.assertEqual("G1", reservation.group_id)
         self.assertEqual(
             datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
             reservation.start_at_utc,
@@ -207,22 +231,26 @@ class GoogleSheetsRepositoryTests(TestCase):
         repository = RowBackedSheetsRepository()
         repository.service = RecordingService()
 
-        repository.add_reservation(
-            ScheduledReservation(
-                "R1",
-                "kayak1",
-                datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
-                datetime(2026, 7, 15, 22, 0, tzinfo=UTC),
-                "Taylor Smith",
-                "U123",
-            )
+        repository.add_reservations(
+            [
+                ScheduledReservation(
+                    "R1",
+                    "kayak1",
+                    datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+                    datetime(2026, 7, 15, 22, 0, tzinfo=UTC),
+                    "Taylor Smith",
+                    "U123",
+                    "G1",
+                )
+            ]
         )
 
         call = repository.service.spreadsheets_api.values_api.append_calls[0]
-        self.assertEqual("'Reservations'!A:F", call["range"])
+        self.assertEqual("'Reservations'!A:G", call["range"])
         self.assertEqual(
             [[
                 "R1",
+                "G1",
                 "kayak1",
                 "2026-07-15 01:00 PM PDT (UTC-07:00)",
                 "2026-07-15 03:00 PM PDT (UTC-07:00)",
@@ -238,6 +266,7 @@ class GoogleSheetsRepositoryTests(TestCase):
                 RESERVATION_HEADERS,
                 [
                     "R1",
+                    "G1",
                     "kayak1",
                     "2026-07-15T20:00:00Z",
                     "2026-07-15T22:00:00Z",
@@ -246,6 +275,7 @@ class GoogleSheetsRepositoryTests(TestCase):
                 ],
                 [
                     "R2",
+                    "G2",
                     "kayak2",
                     "2026-07-16T20:00:00Z",
                     "2026-07-16T22:00:00Z",
@@ -256,10 +286,10 @@ class GoogleSheetsRepositoryTests(TestCase):
         )
         repository.service = RecordingService()
 
-        repository.delete_reservation(reservation_id="R2")
+        repository.delete_reservations(reservation_ids=["R2"])
 
-        call = repository.service.spreadsheets_api.values_api.clear_calls[0]
-        self.assertEqual("'Reservations'!A3:F3", call["range"])
+        call = repository.service.spreadsheets_api.values_api.batch_clear_calls[0]
+        self.assertEqual(["'Reservations'!A3:G3"], call["body"]["ranges"])
 
     def test_seeds_existing_active_item_into_empty_schedule(self) -> None:
         repository = RowBackedSheetsRepository(
@@ -275,8 +305,9 @@ class GoogleSheetsRepositoryTests(TestCase):
         call = repository.service.spreadsheets_api.values_api.append_calls[0]
         values = call["body"]["values"][0]
         self.assertTrue(values[0].startswith("migrated-"))
-        self.assertEqual("kayak1", values[1])
-        self.assertEqual("Taylor Smith", values[4])
+        self.assertEqual(values[0], values[1])
+        self.assertEqual("kayak1", values[2])
+        self.assertEqual("Taylor Smith", values[5])
 
     def test_migrates_original_six_column_layout(self) -> None:
         migrated = migrate_item_rows(
@@ -303,4 +334,33 @@ class GoogleSheetsRepositoryTests(TestCase):
         self.assertEqual(["kayak1", "A", "", ""], migrated[1])
         self.assertEqual(
             ["kayak2", "B", "2026-07-15T22:00:00Z", ""], migrated[2]
+        )
+
+    def test_migrates_single_item_schedule_and_preserves_rows(self) -> None:
+        migrated = migrate_reservation_rows(
+            [
+                PRE_GROUP_RESERVATION_HEADERS,
+                [
+                    "R1",
+                    "kayak1",
+                    "2026-07-15T20:00:00Z",
+                    "2026-07-15T22:00:00Z",
+                    "Taylor Smith",
+                    "U123",
+                ],
+            ]
+        )
+
+        self.assertEqual(RESERVATION_HEADERS, migrated[0])
+        self.assertEqual(
+            [
+                "R1",
+                "R1",
+                "kayak1",
+                "2026-07-15T20:00:00Z",
+                "2026-07-15T22:00:00Z",
+                "Taylor Smith",
+                "U123",
+            ],
+            migrated[1],
         )

@@ -8,14 +8,15 @@ and updates the item's current reservation state.
 
 - Direct messages through Slack's `message.im` event
 - Channel requests through the `app_mention` event
-- Block Kit reservation modal with item search plus start/end date and time pickers
+- Block Kit reservation modal with a multi-item search plus combined Start and End datetime pickers
 - Global **Reserve an item** Slack shortcut
 - One unique inventory item per sheet row
 - Immediate and future reservation scheduling
 - Overlap rejection, with back-to-back reservations allowed
 - Automatic activation and expiry reconciliation every 30 seconds
 - Confirm and Cancel buttons before a sheet write
-- Owner-only `cancel <item>` for confirmed reservations
+- Grouped reservations for up to 10 items with all-or-nothing conflict checks
+- Owner-only `cancel <item>` for confirmed reservation groups
 - Availability checks before confirmation and immediately before writing
 - A process-level write lock for simultaneous requests
 - `status` and `status <item>` availability commands
@@ -33,23 +34,25 @@ cancel kayak1
 ```
 
 The preferred reservation flow is to send `reserve`, click **Open reservation
-form**, and use the dropdown and start/end controls. **Start now** is selected by
-default and uses the exact time the form is submitted; choose **Schedule for
-later** to use the scheduled start fields. The full text form remains available
-as a fallback.
+form**, and select up to 10 items that need the same start and end time. The
+combined **Start** picker defaults to now and the combined **End** picker defaults
+to one hour later. Change either the date or time directly; no separate start-mode
+choice is needed. Leaving the default Start unchanged uses the exact submission
+time. The full text form remains available as a single-item fallback.
 
 ## Availability model
 
 The `Reservations` tab is the schedule source of truth:
 
-| reservation_id | item_name | start_time | end_time | reserved_by | slack_user_id |
-|---|---|---|---|---|---|
-| generated UUID | kayak1 | 2026-07-18 01:00 PM PDT (UTC-07:00) | 2026-07-18 05:00 PM PDT (UTC-07:00) | Taylor Smith | U123... |
+| reservation_id | group_id | item_name | start_time | end_time | reserved_by | slack_user_id |
+|---|---|---|---|---|---|---|
+| generated UUID | shared group UUID | kayak1 | 2026-07-18 01:00 PM PDT (UTC-07:00) | 2026-07-18 05:00 PM PDT (UTC-07:00) | Taylor Smith | U123... |
+| generated UUID | shared group UUID | paddle1 | 2026-07-18 01:00 PM PDT (UTC-07:00) | 2026-07-18 05:00 PM PDT (UTC-07:00) | Taylor Smith | U123... |
 
-The bot writes a row as soon as a reservation is confirmed. It rejects a new
-reservation when its `[start, end)` interval overlaps another row for the same
-item. Because the end is exclusive, one reservation may start exactly when the
-previous one ends.
+The bot validates every selected item before writing any of them, then appends
+one row per item with a shared `group_id`. If any selected item overlaps, the
+whole attempt fails and no new rows are written. Because the `[start, end)` end
+is exclusive, one reservation may start exactly when the previous one ends.
 
 The `Items` tab remains the simple live inventory view:
 
@@ -65,8 +68,9 @@ The `Items` tab remains the simple live inventory view:
 - Within 30 seconds after the end, the bot clears the two live-state cells and
   removes the ended row from `Reservations`.
 - The same reconciliation runs immediately at startup, so downtime is repaired.
-- `cancel <item>` cancels the person's active reservation, or their earliest
-  upcoming reservation when none is active.
+- `cancel <item>` cancels the person's active reservation group, or their
+  earliest upcoming group when none is active. Every item sharing its `group_id`
+  is cancelled together.
 - Every item implicitly has quantity 1.
 - Item names must be unique; the name acts as the lookup key.
 - Partial names work only when they match exactly one item.
@@ -169,9 +173,10 @@ For this scheduled-reservation upgrade, initialize the new schedule tab with:
 inventory-sheet-init --migrate-reservations
 ```
 
-If an older `Reservations` tab exists, the command copies it to a timestamped
-`Reservations Backup ...` tab before replacing its headers. Any currently active
-state in `Items` is then seeded into the new schedule so it is not lost.
+If the earlier six-column `Reservations` tab exists, the command copies it to a
+timestamped `Reservations Backup ...` tab and preserves every schedule row while
+adding a `group_id`. Each older single-item row becomes its own group. Any active
+state found only in `Items` is seeded into the schedule so it is not lost.
 
 After migration, add or edit items in the first two columns only:
 
@@ -200,9 +205,11 @@ reserve
 @InventoryBot reserve
 ```
 
-Then click **Open reservation form**. The item control searches the current
-Google Sheet and offers every configured item. The modal's start/end controls use
-`INVENTORY_TIMEZONE`; conflicts are checked when the reservation is committed.
+Then click **Open reservation form**. The multi-select searches the current
+Google Sheet and lets the user choose up to 10 configured items. Slack displays
+the combined datetime pickers in the user's local Slack timezone; confirmations
+and sheet timestamps use `INVENTORY_TIMEZONE`. Every selected item is checked
+again when the reservation is committed.
 
 The process must stay running to receive Socket Mode events. For production,
 deploy one continuously running instance and place all tokens and Google
@@ -250,6 +257,9 @@ python -m compileall -q src
 
 - The process-level lock protects one bot instance. Do not horizontally scale the
   bot while Google Sheets is the source of truth.
+- Multi-item schedule appends, live-state updates, and cancellations use batched
+  Google Sheets requests, so selecting several items does not multiply the main
+  API request count one-for-one.
 - New scheduled rows retain the Slack user ID internally for owner-safe
   cancellation; `Items` still shows only the readable holder name.
 - Ended schedule rows are removed, so the sheet does not provide reservation
