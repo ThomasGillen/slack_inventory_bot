@@ -196,11 +196,11 @@ class ReservationServiceTests(TestCase):
         prepared = self.prepare()
         self.service.commit(prepared.pending, reserved_by_name="Taylor Smith")
 
-        reservation = self.service.cancel(
+        result = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual(("kayak1",), reservation.item_names)
+        self.assertEqual(("kayak1",), result.cancelled.item_names)
         self.assertIsNone(self.repository.items[0].reservation_end_utc)
         self.assertEqual("", self.repository.items[0].reserved_by)
         self.assertEqual([], self.repository.reservations)
@@ -218,11 +218,11 @@ class ReservationServiceTests(TestCase):
         prepared = self.prepare()
         self.service.commit(prepared.pending)
 
-        reservation = self.service.cancel(
+        result = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual(("kayak1",), reservation.item_names)
+        self.assertEqual(("kayak1",), result.cancelled.item_names)
 
     def test_cannot_cancel_available_item(self) -> None:
         with self.assertRaisesRegex(CancellationError, "active or upcoming"):
@@ -324,7 +324,7 @@ class ReservationServiceTests(TestCase):
         self.assertEqual([], self.repository.reservations)
         self.assertIsNone(self.repository.items[0].reservation_end_utc)
 
-    def test_cancels_earliest_owned_upcoming_reservation(self) -> None:
+    def test_multiple_upcoming_reservations_require_manager_choice(self) -> None:
         for index, hours in enumerate((3, 6), start=1):
             self.repository.reservations.append(
                 ScheduledReservation(
@@ -337,12 +337,17 @@ class ReservationServiceTests(TestCase):
                 )
             )
 
-        cancelled = self.service.cancel(
-            "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
-        )
+        with self.assertRaisesRegex(CancellationError, "multiple upcoming"):
+            self.service.cancel(
+                "kayak1",
+                requester_user_id="U123",
+                requester_name="Taylor Smith",
+            )
 
-        self.assertEqual("R1", cancelled.reservations[0].reservation_id)
-        self.assertEqual(["R2"], [value.reservation_id for value in self.repository.reservations])
+        self.assertEqual(
+            ["R1", "R2"],
+            [value.reservation_id for value in self.repository.reservations],
+        )
 
     def test_multi_item_commit_is_grouped_and_batched(self) -> None:
         pending = PendingReservation(
@@ -407,7 +412,7 @@ class ReservationServiceTests(TestCase):
 
         self.assertEqual([], self.repository.add_batches)
 
-    def test_cancel_one_item_cancels_its_whole_group(self) -> None:
+    def test_cancel_one_item_preserves_rest_of_group(self) -> None:
         pending = PendingReservation(
             item_names=("kayak1", "kayak2"),
             start_at_utc=self.now,
@@ -416,13 +421,126 @@ class ReservationServiceTests(TestCase):
         )
         committed = self.service.commit(pending, reserved_by_name="Taylor Smith")
 
-        cancelled = self.service.cancel(
+        result = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
         )
 
-        self.assertEqual(committed.group_id, cancelled.group_id)
-        self.assertEqual(("kayak1", "kayak2"), cancelled.item_names)
-        self.assertEqual([], self.repository.reservations)
+        self.assertEqual(committed.group_id, result.cancelled.group_id)
+        self.assertEqual(("kayak1",), result.cancelled.item_names)
+        self.assertEqual(
+            ("kayak2",),
+            tuple(value.item_name for value in result.remaining),
+        )
+        self.assertEqual(
+            ["kayak2"],
+            [value.item_name for value in self.repository.reservations],
+        )
         self.assertEqual(1, len(self.repository.delete_batches))
+        self.assertEqual(1, len(self.repository.delete_batches[0]))
+        self.assertIsNone(self.repository.items[0].reservation_end_utc)
+        self.assertIsNotNone(self.repository.items[1].reservation_end_utc)
+
+    def test_explicit_group_cancel_removes_every_item(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+        committed = self.service.commit(pending, reserved_by_name="Taylor Smith")
+
+        result = self.service.cancel(
+            "kayak1",
+            requester_user_id="U123",
+            requester_name="Taylor Smith",
+            whole_group=True,
+        )
+
+        self.assertEqual(committed.group_id, result.cancelled.group_id)
+        self.assertEqual(("kayak1", "kayak2"), result.cancelled.item_names)
+        self.assertEqual((), result.remaining)
+        self.assertEqual([], self.repository.reservations)
         self.assertEqual(2, len(self.repository.delete_batches[0]))
-        self.assertTrue(all(item.reservation_end_utc is None for item in self.repository.items))
+
+    def test_cancel_selected_removes_only_chosen_group_rows(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+        committed = self.service.commit(pending, reserved_by_name="Taylor Smith")
+        kayak2 = next(
+            value
+            for value in committed.reservations
+            if value.item_name == "kayak2"
+        )
+
+        result = self.service.cancel_selected(
+            committed.group_id,
+            (kayak2.reservation_id,),
+            requester_user_id="U123",
+            requester_name="Taylor Smith",
+        )
+
+        self.assertEqual(("kayak2",), result.cancelled.item_names)
+        self.assertEqual(
+            ("kayak1",),
+            tuple(value.item_name for value in result.remaining),
+        )
+        self.assertEqual(
+            ["kayak1"],
+            [value.item_name for value in self.repository.reservations],
+        )
+
+    def test_cancel_group_by_id_rechecks_owner_and_removes_all_rows(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+        committed = self.service.commit(pending, reserved_by_name="Taylor Smith")
+
+        with self.assertRaisesRegex(CancellationError, "Only the person"):
+            self.service.cancel_group(
+                committed.group_id,
+                requester_user_id="U999",
+                requester_name="Morgan Jones",
+            )
+
+        result = self.service.cancel_group(
+            committed.group_id,
+            requester_user_id="U123",
+            requester_name="Taylor Smith",
+        )
+
+        self.assertEqual(("kayak1", "kayak2"), result.cancelled.item_names)
+        self.assertEqual([], self.repository.reservations)
+
+    def test_lists_only_requesters_reservation_groups(self) -> None:
+        own = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now + timedelta(hours=1),
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+        committed = self.service.commit(own, reserved_by_name="Taylor Smith")
+        self.repository.reservations.append(
+            ScheduledReservation(
+                "R-other",
+                "paddle1",
+                self.now + timedelta(hours=1),
+                self.now + timedelta(hours=2),
+                "Morgan Jones",
+                "U999",
+                "G-other",
+            )
+        )
+
+        groups = self.service.reservation_groups_for_user(
+            requester_user_id="U123", requester_name="Taylor Smith"
+        )
+
+        self.assertEqual([committed.group_id], [group.group_id for group in groups])
+        self.assertEqual(("kayak1", "kayak2"), groups[0].item_names)

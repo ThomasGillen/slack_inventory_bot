@@ -15,6 +15,7 @@ from .errors import (
     ParseError,
 )
 from .models import (
+    CancellationResult,
     InventoryAvailability,
     Item,
     PendingReservation,
@@ -185,14 +186,14 @@ class ReservationService:
         *,
         requester_user_id: str,
         requester_name: str = "",
-    ) -> ReservationGroup:
+        whole_group: bool = False,
+    ) -> CancellationResult:
+        """Cancel one item by default, or its complete group when requested."""
         with self._write_lock:
             now = self._now()
             items = self.repository.list_items()
             item = self._resolve_item(item_query, items)
-            owners = {_normalized(requester_user_id)}
-            if requester_name:
-                owners.add(_normalized(requester_name))
+            owners = self._owner_keys(requester_user_id, requester_name)
 
             all_reservations = self._remove_expired(now)
             reservations = [
@@ -204,52 +205,39 @@ class ReservationService:
             owned = [
                 reservation
                 for reservation in reservations
-                if reservation.slack_user_id == requester_user_id
-                or _normalized(reservation.reserved_by) in owners
+                if self._owned_by(reservation, requester_user_id, owners)
             ]
             if owned:
-                active = [reservation for reservation in owned if reservation.start_at_utc <= now]
-                selected = min(active or owned, key=lambda value: value.start_at_utc)
-                group_id = selected.group_id or selected.reservation_id
-                group_rows = [
+                active = [
                     reservation
-                    for reservation in all_reservations
-                    if (reservation.group_id or reservation.reservation_id) == group_id
+                    for reservation in owned
+                    if reservation.start_at_utc <= now
                 ]
-                if not all(
-                    reservation.slack_user_id == requester_user_id
-                    or _normalized(reservation.reserved_by) in owners
-                    for reservation in group_rows
-                ):
+                candidates = active or owned
+                if len(candidates) > 1:
                     raise CancellationError(
-                        "This reservation group has inconsistent ownership in the sheet."
+                        f"You have multiple upcoming reservations for {item.item_name}. "
+                        "Send `cancel` and choose the reservation by time."
                     )
-                self.repository.delete_reservations(
-                    reservation_ids=[
-                        reservation.reservation_id for reservation in group_rows
+                selected = candidates[0]
+                selected_rows = [selected]
+                if whole_group:
+                    group_id = self._effective_group_id(selected)
+                    selected_rows = [
+                        reservation
+                        for reservation in all_reservations
+                        if self._effective_group_id(reservation) == group_id
                     ]
-                )
-                self._reconcile_locked(now)
-                locations_by_name = {
-                    _normalized(value.item_name): value.location for value in items
-                }
-                return ReservationGroup(
-                    group_id=group_id,
-                    reservations=tuple(
-                        Reservation(
-                            reservation_id=reservation.reservation_id,
-                            item_name=reservation.item_name,
-                            location=locations_by_name.get(
-                                _normalized(reservation.item_name), ""
-                            ),
-                            start_at_utc=reservation.start_at_utc,
-                            end_at_utc=reservation.end_at_utc,
-                            group_id=group_id,
-                        )
-                        for reservation in sorted(
-                            group_rows, key=lambda value: value.item_name.casefold()
-                        )
-                    ),
+                    self._assert_owned_rows(
+                        selected_rows,
+                        requester_user_id=requester_user_id,
+                        owners=owners,
+                    )
+                return self._cancel_rows_locked(
+                    selected_rows,
+                    all_reservations=all_reservations,
+                    items=items,
+                    now=now,
                 )
 
             if reservations:
@@ -270,18 +258,245 @@ class ReservationService:
                     f"Only the person who reserved {item.item_name} can cancel it."
                 )
             self.repository.clear_item_reservations(item_names=[item.item_name])
-            return ReservationGroup(
-                group_id="",
-                reservations=(
-                    Reservation(
-                        reservation_id="",
-                        item_name=item.item_name,
-                        location=item.location,
-                        start_at_utc=now,
-                        end_at_utc=item.reservation_end_utc,
+            return CancellationResult(
+                cancelled=ReservationGroup(
+                    group_id="",
+                    reservations=(
+                        Reservation(
+                            reservation_id="",
+                            item_name=item.item_name,
+                            location=item.location,
+                            start_at_utc=now,
+                            end_at_utc=item.reservation_end_utc,
+                        ),
                     ),
                 ),
             )
+
+    def reservation_groups_for_user(
+        self,
+        *,
+        requester_user_id: str,
+        requester_name: str = "",
+    ) -> list[ReservationGroup]:
+        """Return the requester's active and upcoming reservations by group."""
+        with self._write_lock:
+            now = self._now()
+            items = self.repository.list_items()
+            reservations = self._remove_expired(now)
+            owners = self._owner_keys(requester_user_id, requester_name)
+            owned = [
+                reservation
+                for reservation in reservations
+                if self._owned_by(reservation, requester_user_id, owners)
+            ]
+            grouped: dict[str, list[ScheduledReservation]] = {}
+            for reservation in owned:
+                grouped.setdefault(
+                    self._effective_group_id(reservation), []
+                ).append(reservation)
+            groups = [
+                self._to_reservation_group(group_id, rows, items)
+                for group_id, rows in grouped.items()
+            ]
+            return sorted(
+                groups,
+                key=lambda group: (group.start_at_utc, group.item_names),
+            )
+
+    def cancel_selected(
+        self,
+        group_id: str,
+        reservation_ids: tuple[str, ...],
+        *,
+        requester_user_id: str,
+        requester_name: str = "",
+    ) -> CancellationResult:
+        """Cancel selected item rows from one owned reservation group."""
+        if not reservation_ids:
+            raise CancellationError("Choose at least one item to cancel.")
+        with self._write_lock:
+            now = self._now()
+            items = self.repository.list_items()
+            reservations = self._remove_expired(now)
+            owners = self._owner_keys(requester_user_id, requester_name)
+            group_rows = self._owned_group_rows(
+                group_id,
+                reservations,
+                requester_user_id=requester_user_id,
+                owners=owners,
+            )
+            requested = set(reservation_ids)
+            selected_rows = [
+                reservation
+                for reservation in group_rows
+                if reservation.reservation_id in requested
+            ]
+            if len(selected_rows) != len(requested):
+                raise CancellationError(
+                    "One or more selected items no longer belong to this reservation."
+                )
+            return self._cancel_rows_locked(
+                selected_rows,
+                all_reservations=reservations,
+                items=items,
+                now=now,
+            )
+
+    def cancel_group(
+        self,
+        group_id: str,
+        *,
+        requester_user_id: str,
+        requester_name: str = "",
+    ) -> CancellationResult:
+        """Cancel every item row in one owned reservation group."""
+        with self._write_lock:
+            now = self._now()
+            items = self.repository.list_items()
+            reservations = self._remove_expired(now)
+            owners = self._owner_keys(requester_user_id, requester_name)
+            group_rows = self._owned_group_rows(
+                group_id,
+                reservations,
+                requester_user_id=requester_user_id,
+                owners=owners,
+            )
+            return self._cancel_rows_locked(
+                group_rows,
+                all_reservations=reservations,
+                items=items,
+                now=now,
+            )
+
+    @staticmethod
+    def _owner_keys(requester_user_id: str, requester_name: str) -> set[str]:
+        owners = {_normalized(requester_user_id)}
+        if requester_name:
+            owners.add(_normalized(requester_name))
+        return owners
+
+    @staticmethod
+    def _owned_by(
+        reservation: ScheduledReservation,
+        requester_user_id: str,
+        owners: set[str],
+    ) -> bool:
+        if reservation.slack_user_id:
+            return reservation.slack_user_id == requester_user_id
+        return _normalized(reservation.reserved_by) in owners
+
+    @staticmethod
+    def _effective_group_id(reservation: ScheduledReservation) -> str:
+        return reservation.group_id or reservation.reservation_id
+
+    def _assert_owned_rows(
+        self,
+        reservations: list[ScheduledReservation],
+        *,
+        requester_user_id: str,
+        owners: set[str],
+    ) -> None:
+        if not all(
+            self._owned_by(reservation, requester_user_id, owners)
+            for reservation in reservations
+        ):
+            raise CancellationError(
+                "Only the person who made this reservation can cancel it."
+            )
+
+    def _owned_group_rows(
+        self,
+        group_id: str,
+        reservations: list[ScheduledReservation],
+        *,
+        requester_user_id: str,
+        owners: set[str],
+    ) -> list[ScheduledReservation]:
+        rows = [
+            reservation
+            for reservation in reservations
+            if self._effective_group_id(reservation) == group_id
+        ]
+        if not rows:
+            raise CancellationError(
+                "That reservation no longer exists or has already ended."
+            )
+        self._assert_owned_rows(
+            rows,
+            requester_user_id=requester_user_id,
+            owners=owners,
+        )
+        return rows
+
+    def _cancel_rows_locked(
+        self,
+        selected_rows: list[ScheduledReservation],
+        *,
+        all_reservations: list[ScheduledReservation],
+        items: list[Item],
+        now: datetime,
+    ) -> CancellationResult:
+        if not selected_rows:
+            raise CancellationError("Choose at least one item to cancel.")
+        group_id = self._effective_group_id(selected_rows[0])
+        if any(
+            self._effective_group_id(reservation) != group_id
+            for reservation in selected_rows
+        ):
+            raise CancellationError(
+                "Selected items must belong to the same reservation."
+            )
+        selected_ids = {
+            reservation.reservation_id for reservation in selected_rows
+        }
+        group_rows = [
+            reservation
+            for reservation in all_reservations
+            if self._effective_group_id(reservation) == group_id
+        ]
+        remaining_rows = [
+            reservation
+            for reservation in group_rows
+            if reservation.reservation_id not in selected_ids
+        ]
+        self.repository.delete_reservations(
+            reservation_ids=sorted(selected_ids)
+        )
+        self._reconcile_locked(now)
+        cancelled = self._to_reservation_group(group_id, selected_rows, items)
+        remaining = self._to_reservation_group(
+            group_id, remaining_rows, items
+        ).reservations if remaining_rows else ()
+        return CancellationResult(cancelled=cancelled, remaining=remaining)
+
+    @staticmethod
+    def _to_reservation_group(
+        group_id: str,
+        rows: list[ScheduledReservation],
+        items: list[Item],
+    ) -> ReservationGroup:
+        locations_by_name = {
+            _normalized(item.item_name): item.location for item in items
+        }
+        return ReservationGroup(
+            group_id=group_id,
+            reservations=tuple(
+                Reservation(
+                    reservation_id=reservation.reservation_id,
+                    item_name=reservation.item_name,
+                    location=locations_by_name.get(
+                        _normalized(reservation.item_name), ""
+                    ),
+                    start_at_utc=reservation.start_at_utc,
+                    end_at_utc=reservation.end_at_utc,
+                    group_id=group_id,
+                )
+                for reservation in sorted(
+                    rows, key=lambda value: value.item_name.casefold()
+                )
+            ),
+        )
 
     def _now(self) -> datetime:
         current = self.clock()

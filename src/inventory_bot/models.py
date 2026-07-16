@@ -46,6 +46,12 @@ class ReservationGroup:
 
 
 @dataclass(frozen=True, slots=True)
+class CancellationResult:
+    cancelled: ReservationGroup
+    remaining: tuple[Reservation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ScheduledReservation:
     reservation_id: str
     item_name: str

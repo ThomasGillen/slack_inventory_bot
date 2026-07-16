@@ -16,10 +16,11 @@ and updates the item's current reservation state.
 - Automatic activation and expiry reconciliation every 30 seconds
 - Confirm and Cancel buttons before a sheet write
 - Grouped reservations for up to 10 items with all-or-nothing conflict checks
-- Owner-only `cancel <item>` for confirmed reservation groups
+- Owner-only partial cancellation through commands or Manage Reservations
 - Availability checks before confirmation and immediately before writing
 - A process-level write lock for simultaneous requests
 - `status` and `status <item>` availability commands
+- `help` command with a complete command overview
 - Readable, timezone-qualified sheet times using `INVENTORY_TIMEZONE`
 
 Example requests:
@@ -31,6 +32,8 @@ reserve kayak3 until 2026-07-18 17:00
 status
 status kayak1
 cancel kayak1
+cancel group kayak1
+help
 ```
 
 The preferred reservation flow is to send `reserve`, click **Open reservation
@@ -68,9 +71,15 @@ The `Items` tab remains the simple live inventory view:
 - Within 30 seconds after the end, the bot clears the two live-state cells and
   removes the ended row from `Reservations`.
 - The same reconciliation runs immediately at startup, so downtime is repaired.
-- `cancel <item>` cancels the person's active reservation group, or their
-  earliest upcoming group when none is active. Every item sharing its `group_id`
-  is cancelled together.
+- `cancel <item>` cancels only that item from the person's active reservation, or
+  their sole upcoming reservation for that item.
+- `cancel` opens Manage Reservations, where the owner chooses a reservation and
+  checks exactly which items to cancel. Confirmed reservation messages also have
+  a **Manage reservation** button.
+- `cancel group <item>` explicitly cancels every item sharing the selected
+  reservation's `group_id`.
+- When an item has multiple upcoming reservations, the manager asks the user to
+  choose by time instead of guessing which one to cancel.
 - Every item implicitly has quantity 1.
 - Item names must be unique; the name acts as the lookup key.
 - Partial names work only when they match exactly one item.
@@ -186,11 +195,12 @@ After migration, add or edit items in the first two columns only:
 | kayak2 | B |  |  |
 
 Normally, leave `reservation_end` and `reserved_by` for the bot to manage. To
-release your own item early, send `cancel <item>` to the bot. A sheet manager can
-cancel any booking by clearing its complete row in `Reservations`; the bot will
-then reconcile `Items`. Clearing only the live `Items` cells is temporary because
-an active schedule row will restore them. A `-` is accepted as an empty
-reservation end, though a blank cell is preferred.
+release selected items early, send `cancel` and use Manage Reservations, or send
+`cancel <item>` for one item. A sheet manager can cancel an item by clearing its
+complete row in `Reservations`; clear every row with the same `group_id` to cancel
+the entire group. The bot will then reconcile `Items`. Clearing only the live
+`Items` cells is temporary because an active schedule row will restore them. A
+`-` is accepted as an empty reservation end, though a blank cell is preferred.
 
 ## 5. Run the bot
 
@@ -210,6 +220,11 @@ Google Sheet and lets the user choose up to 10 configured items. Slack displays
 the combined datetime pickers in the user's local Slack timezone; confirmations
 and sheet timestamps use `INVENTORY_TIMEZONE`. Every selected item is checked
 again when the reservation is committed.
+
+Send `cancel` to open the cancellation launcher. The manager lists only the
+requester's active and upcoming reservations, then provides item checkboxes plus
+an explicitly confirmed **Cancel entire reservation** action. Send `help` at any
+time for the full command overview.
 
 The process must stay running to receive Socket Mode events. For production,
 deploy one continuously running instance and place all tokens and Google

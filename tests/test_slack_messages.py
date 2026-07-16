@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest import TestCase
 
 from inventory_bot.models import (
+    CancellationResult,
     InventoryAvailability,
     Item,
     PendingReservation,
@@ -14,11 +15,13 @@ from inventory_bot.models import (
 )
 from inventory_bot.slack_app import (
     _slack_user_name,
+    cancellation_result_message,
     committed_message,
     confirmation_message,
     help_text,
     status_text,
 )
+from inventory_bot.slack_views import MANAGE_RESERVATION_ACTION
 
 
 class SlackMessageTests(TestCase):
@@ -93,6 +96,10 @@ class SlackMessageTests(TestCase):
         self.assertIn("kayak1", text)
         self.assertIn("kayak1", str(blocks))
         self.assertIn("Starts", str(blocks))
+        self.assertEqual(
+            MANAGE_RESERVATION_ACTION,
+            blocks[1]["elements"][0]["action_id"],
+        )
 
     def test_multi_item_confirmation_lists_every_item(self) -> None:
         pending = PendingReservation(
@@ -126,8 +133,25 @@ class SlackMessageTests(TestCase):
         self.assertIn("<@U123>", text)
 
     def test_help_includes_cancel_command(self) -> None:
+        self.assertIn("`cancel`", help_text())
         self.assertIn("cancel <item>", help_text())
+        self.assertIn("cancel group <item>", help_text())
+        self.assertIn("`help`", help_text())
         self.assertIn("from <date/time>", help_text())
+
+    def test_cancellation_message_lists_cancelled_and_remaining_items(self) -> None:
+        start = datetime(2026, 7, 15, 20, 0, tzinfo=UTC)
+        cancelled = Reservation("R1", "kayak1", "A", start, self.end, "G1")
+        remaining = Reservation("R2", "kayak2", "B", start, self.end, "G1")
+        result = CancellationResult(
+            cancelled=ReservationGroup("G1", (cancelled,)),
+            remaining=(remaining,),
+        )
+
+        text = cancellation_result_message(result, self.settings)
+
+        self.assertIn("Cancelled *kayak1*", text)
+        self.assertIn("Remaining in this reservation: *kayak2*", text)
 
     def test_status_shows_next_scheduled_reservation(self) -> None:
         next_reservation = ScheduledReservation(
@@ -187,3 +211,4 @@ class SlackMessageTests(TestCase):
         with self.assertLogs("inventory_bot.slack_app", level="ERROR"):
             fallback = _slack_user_name(FailingClient(), "U123")
         self.assertEqual("U123", fallback)
+    cancellation_result_message,

@@ -9,7 +9,7 @@ from typing import Any
 
 from .config import Settings
 from .errors import ParseError
-from .models import Item, PendingReservation
+from .models import Item, PendingReservation, Reservation, ReservationGroup
 
 RESERVATION_MODAL_CALLBACK = "reservation_modal"
 OPEN_RESERVATION_ACTION = "open_reservation_modal"
@@ -19,6 +19,15 @@ START_BLOCK = "reservation_start"
 START_ACTION = "reservation_start_select"
 END_BLOCK = "reservation_end"
 END_ACTION = "reservation_end_select"
+OPEN_CANCELLATION_ACTION = "open_cancellation_modal"
+MANAGE_RESERVATION_ACTION = "manage_reservation"
+CANCELLATION_GROUP_MODAL_CALLBACK = "cancellation_group_modal"
+CANCELLATION_ITEMS_MODAL_CALLBACK = "cancellation_items_modal"
+CANCELLATION_GROUP_BLOCK = "cancellation_group"
+CANCELLATION_GROUP_ACTION = "cancellation_group_select"
+CANCELLATION_ITEMS_BLOCK = "cancellation_items"
+CANCELLATION_ITEMS_ACTION = "cancellation_items_select"
+CANCEL_ENTIRE_GROUP_ACTION = "cancel_entire_reservation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +50,39 @@ class ModalDestination:
         return cls(
             channel_id=str(payload.get("channel_id", "")),
             thread_ts=str(payload.get("thread_ts", "")),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CancellationModalMetadata:
+    channel_id: str = ""
+    thread_ts: str = ""
+    group_id: str = ""
+
+    @property
+    def destination(self) -> ModalDestination:
+        return ModalDestination(self.channel_id, self.thread_ts)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "channel_id": self.channel_id,
+                "thread_ts": self.thread_ts,
+                "group_id": self.group_id,
+            },
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> "CancellationModalMetadata":
+        try:
+            payload = json.loads(value or "{}")
+        except json.JSONDecodeError:
+            return cls()
+        return cls(
+            channel_id=str(payload.get("channel_id", "")),
+            thread_ts=str(payload.get("thread_ts", "")),
+            group_id=str(payload.get("group_id", "")),
         )
 
 
@@ -68,6 +110,38 @@ def reservation_launcher_message() -> tuple[str, list[dict[str, Any]]]:
                     "text": {"type": "plain_text", "text": "Open reservation form"},
                     "style": "primary",
                     "action_id": OPEN_RESERVATION_ACTION,
+                    "value": "open",
+                }
+            ],
+        },
+    ]
+
+
+def cancellation_launcher_message() -> tuple[str, list[dict[str, Any]]]:
+    text = "Open Manage Reservations to cancel selected items or an entire reservation."
+    return text, [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    "*Manage reservations*\n"
+                    "Choose one of your active or upcoming reservations, then "
+                    "select only the items you want to cancel."
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Manage reservations",
+                    },
+                    "style": "primary",
+                    "action_id": OPEN_CANCELLATION_ACTION,
                     "value": "open",
                 }
             ],
@@ -145,6 +219,250 @@ def build_reservation_modal(
             },
         ],
     }
+
+
+def build_cancellation_group_modal(
+    groups: list[ReservationGroup],
+    settings: Settings,
+    *,
+    destination: ModalDestination = ModalDestination(),
+) -> dict[str, Any]:
+    metadata = CancellationModalMetadata(
+        channel_id=destination.channel_id,
+        thread_ts=destination.thread_ts,
+    )
+    if not groups:
+        return {
+            "type": "modal",
+            "callback_id": CANCELLATION_GROUP_MODAL_CALLBACK,
+            "private_metadata": metadata.to_json(),
+            "title": {"type": "plain_text", "text": "Manage reservations"},
+            "close": {"type": "plain_text", "text": "Close"},
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            ":information_source: You do not have any active or "
+                            "upcoming reservations."
+                        ),
+                    },
+                }
+            ],
+        }
+
+    options = [_reservation_group_option(group, settings) for group in groups[:100]]
+    return {
+        "type": "modal",
+        "callback_id": CANCELLATION_GROUP_MODAL_CALLBACK,
+        "private_metadata": metadata.to_json(),
+        "title": {"type": "plain_text", "text": "Manage reservations"},
+        "submit": {"type": "plain_text", "text": "Next"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "input",
+                "block_id": CANCELLATION_GROUP_BLOCK,
+                "label": {
+                    "type": "plain_text",
+                    "text": "Reservation to manage",
+                },
+                "element": {
+                    "type": "static_select",
+                    "action_id": CANCELLATION_GROUP_ACTION,
+                    "placeholder": {
+                        "type": "plain_text",
+                        "text": "Choose a reservation",
+                    },
+                    "options": options,
+                },
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"Times are shown in *{settings.timezone_name}*.",
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def build_cancellation_items_modal(
+    group: ReservationGroup,
+    settings: Settings,
+    *,
+    destination: ModalDestination = ModalDestination(),
+    initial_reservation_ids: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    metadata = CancellationModalMetadata(
+        channel_id=destination.channel_id,
+        thread_ts=destination.thread_ts,
+        group_id=group.group_id,
+    )
+    options = [_cancellation_item_option(value) for value in group.reservations]
+    initial_ids = set(initial_reservation_ids)
+    initial_options = [
+        option for option in options if option["value"] in initial_ids
+    ]
+    checkbox_element: dict[str, Any] = {
+        "type": "checkboxes",
+        "action_id": CANCELLATION_ITEMS_ACTION,
+        "options": options,
+    }
+    if initial_options:
+        checkbox_element["initial_options"] = initial_options
+
+    start_text = group.start_at_utc.astimezone(settings.timezone).strftime(
+        "%a, %b %d at %I:%M %p"
+    )
+    end_text = group.end_at_utc.astimezone(settings.timezone).strftime(
+        "%a, %b %d at %I:%M %p %Z"
+    )
+    return {
+        "type": "modal",
+        "callback_id": CANCELLATION_ITEMS_MODAL_CALLBACK,
+        "private_metadata": metadata.to_json(),
+        "title": {"type": "plain_text", "text": "Cancel items"},
+        "submit": {"type": "plain_text", "text": "Cancel selected"},
+        "close": {"type": "plain_text", "text": "Keep reservation"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*Reservation:* {start_text} until {end_text}\n"
+                        "Only checked items will be cancelled."
+                    ),
+                },
+            },
+            {
+                "type": "input",
+                "block_id": CANCELLATION_ITEMS_BLOCK,
+                "label": {"type": "plain_text", "text": "Items to cancel"},
+                "element": checkbox_element,
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": CANCEL_ENTIRE_GROUP_ACTION,
+                        "value": group.group_id,
+                        "style": "danger",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "Cancel entire reservation",
+                        },
+                        "confirm": {
+                            "title": {
+                                "type": "plain_text",
+                                "text": "Cancel everything?",
+                            },
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": (
+                                    f"This will cancel all {len(group.reservations)} "
+                                    "items in this reservation."
+                                ),
+                            },
+                            "confirm": {
+                                "type": "plain_text",
+                                "text": "Cancel all",
+                            },
+                            "deny": {
+                                "type": "plain_text",
+                                "text": "Go back",
+                            },
+                            "style": "danger",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def cancellation_complete_view(message: str) -> dict[str, Any]:
+    return {
+        "type": "modal",
+        "title": {"type": "plain_text", "text": "Reservation updated"},
+        "close": {"type": "plain_text", "text": "Close"},
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": message},
+            }
+        ],
+    }
+
+
+def parse_cancellation_group_submission(view: dict[str, Any]) -> str:
+    values = view.get("state", {}).get("values", {})
+    try:
+        return str(
+            values[CANCELLATION_GROUP_BLOCK][CANCELLATION_GROUP_ACTION][
+                "selected_option"
+            ]["value"]
+        )
+    except (KeyError, TypeError):
+        raise ModalInputError(
+            CANCELLATION_GROUP_BLOCK, "Choose a reservation to manage."
+        ) from None
+
+
+def parse_cancellation_items_submission(view: dict[str, Any]) -> tuple[str, ...]:
+    values = view.get("state", {}).get("values", {})
+    try:
+        selected = values[CANCELLATION_ITEMS_BLOCK][CANCELLATION_ITEMS_ACTION][
+            "selected_options"
+        ]
+        reservation_ids = tuple(str(option["value"]) for option in selected)
+    except (KeyError, TypeError):
+        raise ModalInputError(
+            CANCELLATION_ITEMS_BLOCK, "Choose at least one item to cancel."
+        ) from None
+    if not reservation_ids:
+        raise ModalInputError(
+            CANCELLATION_ITEMS_BLOCK, "Choose at least one item to cancel."
+        )
+    return reservation_ids
+
+
+def _reservation_group_option(
+    group: ReservationGroup, settings: Settings
+) -> dict[str, Any]:
+    local_start = group.start_at_utc.astimezone(settings.timezone)
+    local_end = group.end_at_utc.astimezone(settings.timezone)
+    items = ", ".join(group.item_names)
+    label = (
+        f"{local_start.strftime('%a %b %d, %I:%M %p')}–"
+        f"{local_end.strftime('%I:%M %p')} · {items}"
+    )
+    return {
+        "text": {"type": "plain_text", "text": label[:75]},
+        "value": group.group_id,
+    }
+
+
+def _cancellation_item_option(reservation: Reservation) -> dict[str, Any]:
+    option: dict[str, Any] = {
+        "text": {
+            "type": "plain_text",
+            "text": reservation.item_name[:75],
+        },
+        "value": reservation.reservation_id,
+    }
+    if reservation.location:
+        option["description"] = {
+            "type": "plain_text",
+            "text": reservation.location[:75],
+        }
+    return option
 
 
 def item_options(items: list[Item]) -> list[dict[str, Any]]:

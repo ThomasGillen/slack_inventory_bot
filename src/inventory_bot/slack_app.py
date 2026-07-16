@@ -11,6 +11,7 @@ from typing import Any
 from .config import Settings
 from .errors import InventoryBotError
 from .models import (
+    CancellationResult,
     InventoryAvailability,
     PendingReservation,
     PreparedReservation,
@@ -20,13 +21,26 @@ from .repository import InventoryRepository
 from .service import ReservationService
 from .sheets import GoogleSheetsRepository
 from .slack_views import (
+    CANCELLATION_GROUP_BLOCK,
+    CANCELLATION_GROUP_MODAL_CALLBACK,
+    CANCELLATION_ITEMS_MODAL_CALLBACK,
+    CANCEL_ENTIRE_GROUP_ACTION,
     ITEM_ACTION,
+    MANAGE_RESERVATION_ACTION,
+    OPEN_CANCELLATION_ACTION,
     OPEN_RESERVATION_ACTION,
     RESERVATION_MODAL_CALLBACK,
+    CancellationModalMetadata,
     ModalDestination,
     ModalInputError,
+    build_cancellation_group_modal,
+    build_cancellation_items_modal,
     build_reservation_modal,
+    cancellation_complete_view,
+    cancellation_launcher_message,
     item_options,
+    parse_cancellation_group_submission,
+    parse_cancellation_items_submission,
     parse_modal_submission,
     reservation_launcher_message,
 )
@@ -51,6 +65,7 @@ def create_app(
     if isinstance(repo, GoogleSheetsRepository):
         repo.ensure_schema()
     service = ReservationService(repo, timezone=settings.timezone)
+    cancellation_group_cache: dict[tuple[str, str], ReservationGroup] = {}
     app = App(
         token=settings.slack_bot_token,
         token_verification_enabled=token_verification_enabled,
@@ -81,28 +96,37 @@ def create_app(
             return
 
         if command_without_mention.casefold() == "cancel":
+            text_response, blocks = cancellation_launcher_message()
+            say(text=text_response, blocks=blocks, thread_ts=thread_ts)
+            return
+
+        if command_without_mention.casefold() == "cancel group":
             say(
-                text=":warning: Use `cancel <item>`. Example: `cancel kayak1`.",
+                text=(
+                    ":warning: Use `cancel group <item>`, or send `cancel` to "
+                    "choose a reservation in the manager."
+                ),
                 thread_ts=thread_ts,
             )
             return
 
         if command_without_mention.casefold().startswith("cancel "):
-            item_query = command_without_mention.split(maxsplit=1)[1]
+            cancel_query = command_without_mention.split(maxsplit=1)[1]
+            whole_group = cancel_query.casefold().startswith("group ")
+            item_query = (
+                cancel_query.split(maxsplit=1)[1]
+                if whole_group and len(cancel_query.split(maxsplit=1)) == 2
+                else cancel_query
+            )
             try:
                 requester_name = _slack_user_name(client, user_id)
-                reservation_group = service.cancel(
+                result = service.cancel(
                     item_query,
                     requester_user_id=user_id,
                     requester_name=requester_name,
+                    whole_group=whole_group,
                 )
-                item_names = ", ".join(reservation_group.item_names)
-                text_response = (
-                    f":white_check_mark: Reservation cancelled for "
-                    f"*{_escape_mrkdwn(item_names)}* from "
-                    f"{_escape_mrkdwn(_format_end_time(reservation_group.start_at_utc, settings))} "
-                    f"until {_escape_mrkdwn(_format_end_time(reservation_group.end_at_utc, settings))}."
-                )
+                text_response = cancellation_result_message(result, settings)
             except InventoryBotError as exc:
                 text_response = f":warning: {exc}"
             except Exception:
@@ -188,6 +212,76 @@ def create_app(
         except Exception:
             LOGGER.exception("Unable to open the reservation modal from a shortcut")
 
+    def open_cancellation_modal(
+        body: dict[str, Any],
+        client: Any,
+        *,
+        group_id: str = "",
+    ) -> None:
+        user_id = str(body.get("user", {}).get("id", ""))
+        destination = _modal_destination_from_body(body)
+        if not settings.user_allowed(user_id) or (
+            destination.channel_id
+            and not settings.channel_allowed(destination.channel_id)
+        ):
+            return
+        groups = service.reservation_groups_for_user(
+            requester_user_id=user_id,
+            requester_name=_slack_user_name(client, user_id),
+        )
+        for key in [key for key in cancellation_group_cache if key[0] == user_id]:
+            cancellation_group_cache.pop(key, None)
+        for group in groups:
+            cancellation_group_cache[(user_id, group.group_id)] = group
+        if group_id:
+            selected = next(
+                (group for group in groups if group.group_id == group_id), None
+            )
+            if selected is None:
+                _notify_actor(
+                    client,
+                    channel_id=destination.channel_id or user_id,
+                    user_id=user_id,
+                    text=(
+                        "Only the reservation owner can manage it, or it has "
+                        "already ended."
+                    ),
+                )
+                return
+            view = build_cancellation_items_modal(
+                selected,
+                settings,
+                destination=destination,
+            )
+        else:
+            view = build_cancellation_group_modal(
+                groups,
+                settings,
+                destination=destination,
+            )
+        client.views_open(trigger_id=body["trigger_id"], view=view)
+
+    @app.action(OPEN_CANCELLATION_ACTION)
+    def open_cancellation_from_button(
+        ack: Any, body: dict[str, Any], client: Any
+    ) -> None:
+        ack()
+        try:
+            open_cancellation_modal(body, client)
+        except Exception:
+            LOGGER.exception("Unable to open the cancellation modal")
+
+    @app.action(MANAGE_RESERVATION_ACTION)
+    def manage_confirmed_reservation(
+        ack: Any, body: dict[str, Any], client: Any
+    ) -> None:
+        ack()
+        try:
+            group_id = str(body.get("actions", [{}])[0].get("value", ""))
+            open_cancellation_modal(body, client, group_id=group_id)
+        except Exception:
+            LOGGER.exception("Unable to manage the confirmed reservation")
+
     @app.options(ITEM_ACTION)
     def load_available_item_options(ack: Any, payload: dict[str, Any]) -> None:
         user_id = str(payload.get("user", {}).get("id", ""))
@@ -247,6 +341,119 @@ def create_app(
                 user_id=user_id,
                 text=":warning: I couldn't update inventory. Please try again.",
             )
+
+    @app.view(CANCELLATION_GROUP_MODAL_CALLBACK)
+    def choose_cancellation_group(
+        ack: Any, body: dict[str, Any], client: Any
+    ) -> None:
+        user_id = str(body.get("user", {}).get("id", ""))
+        view = body.get("view", {})
+        try:
+            group_id = parse_cancellation_group_submission(view)
+            selected = cancellation_group_cache.get((user_id, group_id))
+            if selected is None:
+                raise ModalInputError(
+                    CANCELLATION_GROUP_BLOCK,
+                    "That reservation no longer exists or has already ended.",
+                )
+        except ModalInputError as exc:
+            ack(response_action="errors", errors={exc.block_id: str(exc)})
+            return
+
+        metadata = CancellationModalMetadata.from_json(
+            str(view.get("private_metadata", ""))
+        )
+        ack(
+            response_action="update",
+            view=build_cancellation_items_modal(
+                selected,
+                settings,
+                destination=metadata.destination,
+            ),
+        )
+
+    @app.view(CANCELLATION_ITEMS_MODAL_CALLBACK)
+    def cancel_selected_items(
+        ack: Any, body: dict[str, Any], client: Any
+    ) -> None:
+        user_id = str(body.get("user", {}).get("id", ""))
+        view = body.get("view", {})
+        try:
+            reservation_ids = parse_cancellation_items_submission(view)
+        except ModalInputError as exc:
+            ack(response_action="errors", errors={exc.block_id: str(exc)})
+            return
+
+        ack()
+        metadata = CancellationModalMetadata.from_json(
+            str(view.get("private_metadata", ""))
+        )
+        try:
+            result = service.cancel_selected(
+                metadata.group_id,
+                reservation_ids,
+                requester_user_id=user_id,
+                requester_name=_slack_user_name(client, user_id),
+            )
+            cancellation_group_cache.pop((user_id, metadata.group_id), None)
+            text_response = cancellation_result_message(result, settings)
+        except InventoryBotError as exc:
+            text_response = f":warning: Cancellation not completed: {exc}"
+        except Exception:
+            LOGGER.exception("Unexpected error while cancelling selected items")
+            text_response = (
+                ":warning: I couldn't cancel those items right now. Please try again."
+            )
+        _post_modal_result(
+            client,
+            destination=metadata.destination,
+            user_id=user_id,
+            text=text_response,
+        )
+
+    @app.action(CANCEL_ENTIRE_GROUP_ACTION)
+    def cancel_entire_group(
+        ack: Any, body: dict[str, Any], client: Any
+    ) -> None:
+        ack()
+        user_id = str(body.get("user", {}).get("id", ""))
+        view = body.get("view", {})
+        metadata = CancellationModalMetadata.from_json(
+            str(view.get("private_metadata", ""))
+        )
+        try:
+            result = service.cancel_group(
+                metadata.group_id,
+                requester_user_id=user_id,
+                requester_name=_slack_user_name(client, user_id),
+            )
+            cancellation_group_cache.pop((user_id, metadata.group_id), None)
+            text_response = cancellation_result_message(result, settings)
+            modal_text = text_response
+        except InventoryBotError as exc:
+            text_response = f":warning: Cancellation not completed: {exc}"
+            modal_text = text_response
+        except Exception:
+            LOGGER.exception("Unexpected error while cancelling a reservation group")
+            text_response = (
+                ":warning: I couldn't cancel that reservation right now. Please try again."
+            )
+            modal_text = text_response
+
+        try:
+            client.views_update(
+                view_id=str(view.get("id", "")),
+                hash=str(view.get("hash", "")),
+                view=cancellation_complete_view(modal_text),
+            )
+        except Exception:
+            LOGGER.exception("Unable to update the cancellation modal result")
+        _post_modal_result(
+            client,
+            destination=metadata.destination,
+            user_id=user_id,
+            text=text_response,
+        )
 
     @app.action("confirm_reservation")
     def confirm_reservation(ack: Any, body: dict[str, Any], client: Any) -> None:
@@ -464,8 +671,44 @@ def committed_message(
                     f"*Ends:* {_escape_mrkdwn(end_text)}"
                 ),
             },
-        }
+        },
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Manage reservation",
+                    },
+                    "action_id": MANAGE_RESERVATION_ACTION,
+                    "value": reservation_group.group_id,
+                }
+            ],
+        },
     ]
+
+
+def cancellation_result_message(
+    result: CancellationResult, settings: Settings
+) -> str:
+    cancelled = result.cancelled
+    cancelled_names = ", ".join(cancelled.item_names)
+    start_text = _format_end_time(cancelled.start_at_utc, settings)
+    end_text = _format_end_time(cancelled.end_at_utc, settings)
+    message = (
+        f":white_check_mark: Cancelled *{_escape_mrkdwn(cancelled_names)}* "
+        f"from {_escape_mrkdwn(start_text)} until {_escape_mrkdwn(end_text)}."
+    )
+    if result.remaining:
+        remaining_names = ", ".join(
+            reservation.item_name for reservation in result.remaining
+        )
+        message += (
+            f" Remaining in this reservation: "
+            f"*{_escape_mrkdwn(remaining_names)}*."
+        )
+    return message
 
 
 def _format_prepared_items(prepared: PreparedReservation) -> str:
@@ -528,15 +771,21 @@ def status_text(
 
 def help_text() -> str:
     return (
-        "*Inventory Bot commands*\n"
-        "• `reserve` — open the reservation form\n"
+        "*Inventory Bot help*\n"
+        "• `reserve` — open the multi-item reservation form\n"
+        "• `cancel` — open Manage Reservations and choose items\n"
+        "• `cancel <item>` — cancel only that item\n"
+        "• `cancel group <item>` — cancel its entire reservation group\n"
+        "• `status` — show all inventory availability\n"
+        "• `status <item>` — show one item's availability\n"
+        "• `help` — show this command overview\n\n"
+        "*Text reservation fallback*\n"
         "• `reserve <item> from <date/time> until <date/time>`\n"
-        "• `reserve <item> until <date/time>` — start immediately\n"
-        "• `cancel <item>`\n"
-        "• `status` or `status <item>`\n\n"
-        "Examples:\n"
+        "• `reserve <item> until <date/time>` — start immediately\n\n"
+        "*Examples*\n"
         "`reserve kayak1 from Friday at 1 PM until Friday at 3 PM`\n"
-        "`reserve kayak2 until 2026-07-18 17:00`"
+        "`reserve kayak2 until 2026-07-18 17:00`\n"
+        "`cancel kayak1`"
     )
 
 

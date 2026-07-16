@@ -3,20 +3,32 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest import TestCase
 
-from inventory_bot.models import Item
+from inventory_bot.models import Item, Reservation, ReservationGroup
 from inventory_bot.slack_views import (
+    CANCELLATION_GROUP_ACTION,
+    CANCELLATION_GROUP_BLOCK,
+    CANCELLATION_ITEMS_ACTION,
+    CANCELLATION_ITEMS_BLOCK,
+    CANCEL_ENTIRE_GROUP_ACTION,
     END_ACTION,
     END_BLOCK,
     ITEM_ACTION,
     ITEM_BLOCK,
+    OPEN_CANCELLATION_ACTION,
     OPEN_RESERVATION_ACTION,
     RESERVATION_MODAL_CALLBACK,
     START_ACTION,
     START_BLOCK,
+    CancellationModalMetadata,
     ModalDestination,
     ModalInputError,
+    build_cancellation_group_modal,
+    build_cancellation_items_modal,
     build_reservation_modal,
+    cancellation_launcher_message,
     item_options,
+    parse_cancellation_group_submission,
+    parse_cancellation_items_submission,
     parse_modal_submission,
     reservation_launcher_message,
 )
@@ -26,6 +38,27 @@ class SlackViewTests(TestCase):
     def setUp(self) -> None:
         self.settings = SimpleNamespace(timezone=UTC, timezone_name="UTC")
         self.now = datetime(2026, 7, 14, 23, 0, tzinfo=UTC)
+        self.group = ReservationGroup(
+            "G1",
+            (
+                Reservation(
+                    "R1",
+                    "kayak1",
+                    "Dock A",
+                    self.now + timedelta(hours=1),
+                    self.now + timedelta(hours=3),
+                    "G1",
+                ),
+                Reservation(
+                    "R2",
+                    "kayak2",
+                    "Dock B",
+                    self.now + timedelta(hours=1),
+                    self.now + timedelta(hours=3),
+                    "G1",
+                ),
+            ),
+        )
 
     def modal_view(
         self,
@@ -164,3 +197,85 @@ class SlackViewTests(TestCase):
             )
 
         self.assertEqual(END_BLOCK, raised.exception.block_id)
+
+    def test_cancellation_launcher_contains_manage_button(self) -> None:
+        _, blocks = cancellation_launcher_message()
+
+        self.assertEqual(
+            OPEN_CANCELLATION_ACTION,
+            blocks[1]["elements"][0]["action_id"],
+        )
+
+    def test_cancellation_group_modal_lists_owned_groups(self) -> None:
+        modal = build_cancellation_group_modal(
+            [self.group],
+            self.settings,
+            destination=ModalDestination("C123", "123.456"),
+        )
+
+        selector = modal["blocks"][0]["element"]
+        self.assertEqual("static_select", selector["type"])
+        self.assertEqual("G1", selector["options"][0]["value"])
+        self.assertIn("kayak1", selector["options"][0]["text"]["text"])
+        metadata = CancellationModalMetadata.from_json(modal["private_metadata"])
+        self.assertEqual("C123", metadata.channel_id)
+        self.assertEqual("123.456", metadata.thread_ts)
+
+    def test_cancellation_items_modal_supports_partial_and_entire_group(self) -> None:
+        modal = build_cancellation_items_modal(
+            self.group,
+            self.settings,
+            destination=ModalDestination("C123", "123.456"),
+            initial_reservation_ids=("R1",),
+        )
+
+        checkboxes = modal["blocks"][1]["element"]
+        self.assertEqual("checkboxes", checkboxes["type"])
+        self.assertEqual(["R1", "R2"], [value["value"] for value in checkboxes["options"]])
+        self.assertEqual(["R1"], [value["value"] for value in checkboxes["initial_options"]])
+        self.assertEqual(
+            CANCEL_ENTIRE_GROUP_ACTION,
+            modal["blocks"][2]["elements"][0]["action_id"],
+        )
+        metadata = CancellationModalMetadata.from_json(modal["private_metadata"])
+        self.assertEqual("G1", metadata.group_id)
+
+    def test_parses_cancellation_group_and_selected_items(self) -> None:
+        group_view = {
+            "state": {
+                "values": {
+                    CANCELLATION_GROUP_BLOCK: {
+                        CANCELLATION_GROUP_ACTION: {
+                            "selected_option": {"value": "G1"}
+                        }
+                    }
+                }
+            }
+        }
+        items_view = {
+            "state": {
+                "values": {
+                    CANCELLATION_ITEMS_BLOCK: {
+                        CANCELLATION_ITEMS_ACTION: {
+                            "selected_options": [
+                                {"value": "R1"},
+                                {"value": "R2"},
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+
+        self.assertEqual("G1", parse_cancellation_group_submission(group_view))
+        self.assertEqual(
+            ("R1", "R2"),
+            parse_cancellation_items_submission(items_view),
+        )
+    OPEN_CANCELLATION_ACTION,
+    CancellationModalMetadata,
+    build_cancellation_group_modal,
+    build_cancellation_items_modal,
+    cancellation_launcher_message,
+    parse_cancellation_group_submission,
+    parse_cancellation_items_submission,
