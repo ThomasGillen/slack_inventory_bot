@@ -9,7 +9,13 @@ from typing import Any
 
 from .config import Settings
 from .errors import ParseError
-from .models import Item, PendingReservation, Reservation, ReservationGroup
+from .models import (
+    MAX_RESERVATION_ITEMS,
+    Item,
+    PendingReservation,
+    Reservation,
+    ReservationGroup,
+)
 
 RESERVATION_MODAL_CALLBACK = "reservation_modal"
 OPEN_RESERVATION_ACTION = "open_reservation_modal"
@@ -99,7 +105,11 @@ def reservation_launcher_message() -> tuple[str, list[dict[str, Any]]]:
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": "*Reserve items*\nChoose up to 10 items, whether to start now, and the end time.",
+                "text": (
+                    "*Reserve items*\n"
+                    f"Choose up to {MAX_RESERVATION_ITEMS} items and set the "
+                    "start and end time."
+                ),
             },
         },
         {
@@ -178,10 +188,10 @@ def build_reservation_modal(
                     "type": "multi_external_select",
                     "action_id": ITEM_ACTION,
                     "min_query_length": 0,
-                    "max_selected_items": 10,
+                    "max_selected_items": MAX_RESERVATION_ITEMS,
                     "placeholder": {
                         "type": "plain_text",
-                        "text": "Choose up to 10 items",
+                        "text": f"Choose up to {MAX_RESERVATION_ITEMS} items",
                     },
                 },
             },
@@ -308,13 +318,18 @@ def build_cancellation_items_modal(
     initial_options = [
         option for option in options if option["value"] in initial_ids
     ]
-    checkbox_element: dict[str, Any] = {
-        "type": "checkboxes",
+    selector_element: dict[str, Any] = {
+        "type": "multi_static_select",
         "action_id": CANCELLATION_ITEMS_ACTION,
         "options": options,
+        "max_selected_items": len(options),
+        "placeholder": {
+            "type": "plain_text",
+            "text": "Choose items to cancel",
+        },
     }
     if initial_options:
-        checkbox_element["initial_options"] = initial_options
+        selector_element["initial_options"] = initial_options
 
     start_text = group.start_at_utc.astimezone(settings.timezone).strftime(
         "%a, %b %d at %I:%M %p"
@@ -336,7 +351,7 @@ def build_cancellation_items_modal(
                     "type": "mrkdwn",
                     "text": (
                         f"*Reservation:* {start_text} until {end_text}\n"
-                        "Only checked items will be cancelled."
+                        "Only selected items will be cancelled."
                     ),
                 },
             },
@@ -344,7 +359,7 @@ def build_cancellation_items_modal(
                 "type": "input",
                 "block_id": CANCELLATION_ITEMS_BLOCK,
                 "label": {"type": "plain_text", "text": "Items to cancel"},
-                "element": checkbox_element,
+                "element": selector_element,
             },
             {
                 "type": "actions",
@@ -499,8 +514,11 @@ def parse_modal_submission(
         raise ModalInputError(ITEM_BLOCK, "Choose at least one inventory item.") from None
     if not item_names:
         raise ModalInputError(ITEM_BLOCK, "Choose at least one inventory item.")
-    if len(item_names) > 10:
-        raise ModalInputError(ITEM_BLOCK, "Choose no more than 10 inventory items.")
+    if len(item_names) > MAX_RESERVATION_ITEMS:
+        raise ModalInputError(
+            ITEM_BLOCK,
+            f"Choose no more than {MAX_RESERVATION_ITEMS} inventory items.",
+        )
     if len({_normalized_item_name(name) for name in item_names}) != len(item_names):
         raise ModalInputError(ITEM_BLOCK, "Choose each inventory item only once.")
 

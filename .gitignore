@@ -6,8 +6,8 @@ __pycache__/
 .coverage
 .pytest_cache/
 .ruff_cache/
+.inventory_bot/
 build/
 dist/
 service-account*.json
 credentials*.json
-

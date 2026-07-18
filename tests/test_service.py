@@ -26,8 +26,10 @@ class FakeRepository:
         self.delete_batches: list[list[str]] = []
         self.update_batches: list[list[ScheduledReservation]] = []
         self.clear_batches: list[list[str]] = []
+        self.list_item_calls = 0
 
     def list_items(self) -> list[Item]:
+        self.list_item_calls += 1
         return list(self.items)
 
     def list_reservations(self) -> list[ScheduledReservation]:
@@ -374,6 +376,62 @@ class ReservationServiceTests(TestCase):
         self.assertEqual(2, len(self.repository.update_batches[0]))
         self.assertTrue(all(item.reservation_end_utc for item in self.repository.items))
 
+    def test_queue_group_id_makes_commit_idempotent(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+
+        first = self.service.commit(
+            pending,
+            reserved_by_name="Taylor Smith",
+            group_id="queue-request-1",
+        )
+        second = self.service.commit(
+            pending,
+            reserved_by_name="Taylor Smith",
+            group_id="queue-request-1",
+        )
+
+        self.assertEqual("queue-request-1", first.group_id)
+        self.assertEqual(first, second)
+        self.assertEqual(2, len(self.repository.reservations))
+        self.assertEqual(1, len(self.repository.add_batches))
+        self.assertEqual(1, len(self.repository.update_batches))
+
+    def test_queue_group_id_collision_is_rejected(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1",),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+        self.service.commit(pending, group_id="queue-request-1")
+        different = PendingReservation(
+            item_names=("kayak2",),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=2),
+            requester_user_id="U123",
+        )
+
+        with self.assertRaisesRegex(ParseError, "different reservation"):
+            self.service.commit(different, group_id="queue-request-1")
+
+    def test_item_picker_cache_collapses_repeated_sheet_reads(self) -> None:
+        service = ReservationService(
+            self.repository,
+            timezone=timezone(timedelta(hours=-7), name="PDT"),
+            clock=lambda: self.now,
+            inventory_cache_ttl_seconds=15,
+        )
+
+        service.inventory_items("kay")
+        service.inventory_items("kayak1")
+
+        self.assertEqual(1, self.repository.list_item_calls)
+
     def test_multi_item_conflict_rejects_entire_group(self) -> None:
         existing = ScheduledReservation(
             "R-existing",
@@ -399,18 +457,38 @@ class ReservationServiceTests(TestCase):
         self.assertEqual([], self.repository.add_batches)
         self.assertEqual([], self.repository.update_batches)
 
-    def test_multi_item_commit_limits_group_to_ten_items(self) -> None:
+    def test_multi_item_commit_limits_group_to_twenty_items(self) -> None:
         pending = PendingReservation(
-            item_names=tuple(f"item-{index}" for index in range(11)),
+            item_names=tuple(f"item-{index}" for index in range(21)),
             start_at_utc=self.now,
             end_at_utc=self.now + timedelta(hours=1),
             requester_user_id="U123",
         )
 
-        with self.assertRaisesRegex(ParseError, "no more than 10"):
+        with self.assertRaisesRegex(ParseError, "no more than 20"):
             self.service.commit(pending)
 
         self.assertEqual([], self.repository.add_batches)
+
+    def test_multi_item_commit_accepts_twenty_items(self) -> None:
+        items = [Item(f"item-{index}", "A") for index in range(20)]
+        repository = FakeRepository(items=items)
+        service = ReservationService(
+            repository,
+            timezone=timezone(timedelta(hours=-7), name="PDT"),
+            clock=lambda: self.now,
+        )
+        pending = PendingReservation(
+            item_names=tuple(item.item_name for item in items),
+            start_at_utc=self.now,
+            end_at_utc=self.now + timedelta(hours=1),
+            requester_user_id="U123",
+        )
+
+        group = service.commit(pending, reserved_by_name="Taylor Smith")
+
+        self.assertEqual(20, len(group.reservations))
+        self.assertEqual(20, len(repository.add_batches[0]))
 
     def test_cancel_one_item_preserves_rest_of_group(self) -> None:
         pending = PendingReservation(

@@ -6,6 +6,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, tzinfo
+from time import monotonic
 
 from .errors import (
     AmbiguousItemError,
@@ -18,6 +19,7 @@ from .models import (
     CancellationResult,
     InventoryAvailability,
     Item,
+    MAX_RESERVATION_ITEMS,
     PendingReservation,
     PreparedReservation,
     Reservation,
@@ -43,11 +45,17 @@ class ReservationService:
         *,
         timezone: tzinfo,
         clock: Callable[[], datetime] = _utc_now,
+        inventory_cache_ttl_seconds: float = 0.0,
     ) -> None:
         self.repository = repository
         self.timezone = timezone
         self.clock = clock
+        self.inventory_cache_ttl_seconds = max(0.0, inventory_cache_ttl_seconds)
         self._write_lock = threading.Lock()
+        self._inventory_cache_lock = threading.Lock()
+        self._inventory_cache: list[Item] = []
+        self._inventory_cache_loaded_at = 0.0
+        self._inventory_cache_loaded = False
 
     def prepare(
         self,
@@ -79,12 +87,52 @@ class ReservationService:
         pending: PendingReservation,
         *,
         reserved_by_name: str | None = None,
+        group_id: str | None = None,
     ) -> ReservationGroup:
         with self._write_lock:
             now = self._now()
-            items = self._items_by_name(
-                pending.item_names, self.repository.list_items()
-            )
+            all_items = self.repository.list_items()
+            existing_reservations: list[ScheduledReservation] | None = None
+            committed_group_id = (group_id or "").strip()
+            if group_id is not None and not committed_group_id:
+                raise ParseError("Reservation group ID cannot be empty.")
+            if committed_group_id:
+                existing_reservations = self.repository.list_reservations()
+                existing_group = [
+                    reservation
+                    for reservation in existing_reservations
+                    if self._effective_group_id(reservation) == committed_group_id
+                ]
+                if existing_group:
+                    self._validate_idempotent_group(
+                        existing_group,
+                        pending=pending,
+                    )
+                    items_by_name = {
+                        _normalized(item.item_name): item for item in all_items
+                    }
+                    active_existing = [
+                        reservation
+                        for reservation in existing_group
+                        if reservation.start_at_utc <= now < reservation.end_at_utc
+                        and (
+                            (item := items_by_name.get(
+                                _normalized(reservation.item_name)
+                            ))
+                            is not None
+                        )
+                        and (
+                            item.reservation_end_utc != reservation.end_at_utc
+                            or item.reserved_by != reservation.reserved_by
+                        )
+                    ]
+                    if active_existing:
+                        self.repository.update_item_reservations(active_existing)
+                    return self._to_reservation_group(
+                        committed_group_id, existing_group, all_items
+                    )
+
+            items = self._items_by_name(pending.item_names, all_items)
             if pending.end_at_utc <= now:
                 raise ParseError("The reservation end time has already passed.")
             start_at = (pending.start_at_utc or now).astimezone(UTC)
@@ -93,7 +141,9 @@ class ReservationService:
             if pending.end_at_utc <= start_at:
                 raise ParseError("Reservation end time must be after its start time.")
 
-            reservations = self._remove_expired(now)
+            reservations = self._remove_expired(
+                now, reservations=existing_reservations
+            )
             normalized_pending = PendingReservation(
                 item_names=tuple(item.item_name for item in items),
                 start_at_utc=start_at,
@@ -105,7 +155,7 @@ class ReservationService:
                     item, normalized_pending, now, reservations
                 )
 
-            group_id = str(uuid.uuid4())
+            committed_group_id = committed_group_id or str(uuid.uuid4())
             owner_name = " ".join(
                 (reserved_by_name or pending.requester_user_id).split()
             )
@@ -117,7 +167,7 @@ class ReservationService:
                     end_at_utc=pending.end_at_utc.astimezone(UTC),
                     reserved_by=owner_name,
                     slack_user_id=pending.requester_user_id,
-                    group_id=group_id,
+                    group_id=committed_group_id,
                 )
                 for item in items
             ]
@@ -125,7 +175,7 @@ class ReservationService:
             if start_at <= now:
                 self.repository.update_item_reservations(scheduled)
             return ReservationGroup(
-                group_id=group_id,
+                group_id=committed_group_id,
                 reservations=tuple(
                     Reservation(
                         reservation_id=value.reservation_id,
@@ -133,7 +183,7 @@ class ReservationService:
                         location=item.location,
                         start_at_utc=value.start_at_utc,
                         end_at_utc=value.end_at_utc,
-                        group_id=group_id,
+                        group_id=committed_group_id,
                     )
                     for item, value in zip(items, scheduled, strict=True)
                 ),
@@ -173,12 +223,29 @@ class ReservationService:
 
     def inventory_items(self, query: str = "", *, limit: int = 100) -> list[Item]:
         needle = _normalized(query)
+        items = self._picker_inventory_items()
         matches = [
             item
-            for item in self.repository.list_items()
+            for item in items
             if not needle or needle in _normalized(item.item_name)
         ]
         return sorted(matches, key=lambda item: item.item_name.casefold())[:limit]
+
+    def _picker_inventory_items(self) -> list[Item]:
+        """Cache only picker reads; commits and status always read fresh sheet data."""
+        if self.inventory_cache_ttl_seconds <= 0:
+            return self.repository.list_items()
+        with self._inventory_cache_lock:
+            now = monotonic()
+            if (
+                not self._inventory_cache_loaded
+                or now - self._inventory_cache_loaded_at
+                >= self.inventory_cache_ttl_seconds
+            ):
+                self._inventory_cache = self.repository.list_items()
+                self._inventory_cache_loaded_at = now
+                self._inventory_cache_loaded = True
+            return list(self._inventory_cache)
 
     def cancel(
         self,
@@ -553,8 +620,17 @@ class ReservationService:
         )
         return f"{item.item_name} is already reserved from {start_text} until {end_text}."
 
-    def _remove_expired(self, now: datetime) -> list[ScheduledReservation]:
-        reservations = self.repository.list_reservations()
+    def _remove_expired(
+        self,
+        now: datetime,
+        *,
+        reservations: list[ScheduledReservation] | None = None,
+    ) -> list[ScheduledReservation]:
+        reservations = (
+            self.repository.list_reservations()
+            if reservations is None
+            else reservations
+        )
         expired_ids = [
             reservation.reservation_id
             for reservation in reservations
@@ -567,6 +643,30 @@ class ReservationService:
             for reservation in reservations
             if reservation.end_at_utc > now
         ]
+
+    @classmethod
+    def _validate_idempotent_group(
+        cls,
+        reservations: list[ScheduledReservation],
+        *,
+        pending: PendingReservation,
+    ) -> None:
+        stored_names = {
+            _normalized(reservation.item_name) for reservation in reservations
+        }
+        pending_names = {_normalized(name) for name in pending.item_names}
+        expected_end = pending.end_at_utc.astimezone(UTC)
+        if (
+            stored_names != pending_names
+            or any(
+                reservation.slack_user_id != pending.requester_user_id
+                or reservation.end_at_utc != expected_end
+                for reservation in reservations
+            )
+        ):
+            raise ParseError(
+                "A different reservation already uses this request ID."
+            )
 
     def _reconcile_locked(self, now: datetime) -> None:
         reservations = self._remove_expired(now)
@@ -604,8 +704,10 @@ class ReservationService:
     ) -> tuple[Item, ...]:
         if not item_names:
             raise ParseError("Choose at least one inventory item.")
-        if len(item_names) > 10:
-            raise ParseError("Choose no more than 10 inventory items.")
+        if len(item_names) > MAX_RESERVATION_ITEMS:
+            raise ParseError(
+                f"Choose no more than {MAX_RESERVATION_ITEMS} inventory items."
+            )
         normalized_names = [_normalized(name) for name in item_names]
         if len(set(normalized_names)) != len(normalized_names):
             raise ParseError("Choose each inventory item only once.")

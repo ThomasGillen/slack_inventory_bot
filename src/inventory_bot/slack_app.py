@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
+from hashlib import sha256
 from html import escape
 from typing import Any
 
@@ -18,6 +19,13 @@ from .models import (
     ReservationGroup,
 )
 from .repository import InventoryRepository
+from .reservation_queue import (
+    EnqueueResult,
+    QueueDestination,
+    QueuedReservationRequest,
+    ReservationQueueWorker,
+    ReservationRequestQueue,
+)
 from .service import ReservationService
 from .sheets import GoogleSheetsRepository
 from .slack_views import (
@@ -52,6 +60,7 @@ def create_app(
     settings: Settings,
     *,
     repository: InventoryRepository | None = None,
+    reservation_queue: ReservationRequestQueue | None = None,
     token_verification_enabled: bool = True,
 ) -> Any:
     try:
@@ -64,11 +73,43 @@ def create_app(
     repo = repository or GoogleSheetsRepository(settings)
     if isinstance(repo, GoogleSheetsRepository):
         repo.ensure_schema()
-    service = ReservationService(repo, timezone=settings.timezone)
+    service = ReservationService(
+        repo,
+        timezone=settings.timezone,
+        inventory_cache_ttl_seconds=settings.item_picker_cache_seconds,
+    )
+    request_queue = reservation_queue or ReservationRequestQueue(
+        settings.reservation_queue_database
+    )
     cancellation_group_cache: dict[tuple[str, str], ReservationGroup] = {}
     app = App(
         token=settings.slack_bot_token,
         token_verification_enabled=token_verification_enabled,
+    )
+
+    def notify_queued_outcome(request: QueuedReservationRequest) -> None:
+        if request.status == "completed" and request.result is not None:
+            text_response, blocks = committed_message(request.result, settings)
+        else:
+            text_response = (
+                ":warning: Reservation not recorded: "
+                f"{request.last_error or 'The request could not be completed.'}"
+            )
+            blocks = None
+        _deliver_queue_result(
+            app.client,
+            request=request,
+            text=text_response,
+            blocks=blocks,
+        )
+
+    queue_worker = ReservationQueueWorker(
+        request_queue,
+        service,
+        notify_queued_outcome,
+        requests_per_minute=settings.reservation_queue_rate_per_minute,
+        max_attempts=settings.reservation_queue_max_attempts,
+        retention_days=settings.reservation_queue_retention_days,
     )
 
     def handle_message(event: dict[str, Any], say: Any, client: Any) -> None:
@@ -314,32 +355,36 @@ def create_app(
         ack()
         destination = ModalDestination.from_json(str(view.get("private_metadata", "")))
         try:
-            reservation = service.commit(
+            queued = request_queue.enqueue(
                 pending,
                 reserved_by_name=_slack_user_name(client, user_id),
+                dedupe_key=_reservation_dedupe_key(
+                    "modal",
+                    user_id,
+                    str(view.get("id", "")),
+                ),
+                destination=QueueDestination(
+                    mode="post",
+                    channel_id=destination.channel_id or user_id,
+                    thread_ts=destination.thread_ts,
+                ),
             )
-            text_response, blocks = committed_message(reservation, settings)
-            _post_modal_result(
-                client,
-                destination=destination,
-                user_id=user_id,
-                text=text_response,
-                blocks=blocks,
-            )
-        except InventoryBotError as exc:
-            _post_modal_result(
-                client,
-                destination=destination,
-                user_id=user_id,
-                text=f":warning: Reservation not recorded: {exc}",
-            )
+            if queued.created:
+                text_response, blocks = queued_message(queued, settings)
+                _post_modal_result(
+                    client,
+                    destination=destination,
+                    user_id=user_id,
+                    text=text_response,
+                    blocks=blocks,
+                )
         except Exception:
-            LOGGER.exception("Unexpected error while committing a modal reservation")
+            LOGGER.exception("Unable to queue a modal reservation")
             _post_modal_result(
                 client,
                 destination=destination,
                 user_id=user_id,
-                text=":warning: I couldn't update inventory. Please try again.",
+                text=":warning: I couldn't safely queue this request. Please try again.",
             )
 
     @app.view(CANCELLATION_GROUP_MODAL_CALLBACK)
@@ -471,11 +516,29 @@ def create_app(
                     text="Only the person who requested this reservation can confirm it.",
                 )
                 return
-            reservation = service.commit(
+            queued = request_queue.enqueue(
                 pending,
                 reserved_by_name=_slack_user_name(client, actor_id),
+                dedupe_key=_reservation_dedupe_key(
+                    "confirmation",
+                    actor_id,
+                    channel_id,
+                    message_ts,
+                    value,
+                ),
+                destination=QueueDestination(
+                    mode="update",
+                    channel_id=channel_id,
+                    message_ts=message_ts,
+                ),
             )
-            text_response, blocks = committed_message(reservation, settings)
+            if not queued.created and queued.request.status in {
+                "completed",
+                "failed",
+            }:
+                notify_queued_outcome(queued.request)
+                return
+            text_response, blocks = queued_message(queued, settings)
             client.chat_update(
                 channel=channel_id,
                 ts=message_ts,
@@ -486,29 +549,29 @@ def create_app(
             client.chat_update(
                 channel=channel_id,
                 ts=message_ts,
-                text=f"Reservation not recorded: {exc}",
+                text=f"Reservation request not queued: {exc}",
                 blocks=[
                     {
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": f":warning: *Reservation not recorded*\n{_escape_mrkdwn(str(exc))}",
+                            "text": f":warning: *Reservation request not queued*\n{_escape_mrkdwn(str(exc))}",
                         },
                     }
                 ],
             )
         except Exception:
-            LOGGER.exception("Unexpected error while committing a reservation")
+            LOGGER.exception("Unable to queue a reservation")
             client.chat_update(
                 channel=channel_id,
                 ts=message_ts,
-                text="Reservation not recorded because inventory could not be updated.",
+                text="Reservation request could not be safely queued.",
                 blocks=[
                     {
                         "type": "section",
                         "text": {
                             "type": "mrkdwn",
-                            "text": ":warning: *Reservation not recorded*\nPlease try the command again.",
+                            "text": ":warning: *Reservation request not queued*\nPlease try the command again.",
                         },
                     }
                 ],
@@ -552,6 +615,8 @@ def create_app(
             )
 
     setattr(app, "_inventory_service", service)
+    setattr(app, "_reservation_request_queue", request_queue)
+    setattr(app, "_reservation_queue_worker", queue_worker)
     return app
 
 
@@ -581,6 +646,81 @@ def _slack_user_name(client: Any, user_id: str) -> str:
     except Exception:
         LOGGER.exception("Unable to look up Slack profile for %s", user_id)
     return user_id
+
+
+def _reservation_dedupe_key(kind: str, *parts: str) -> str:
+    value = "\x1f".join((kind, *parts)).encode("utf-8")
+    return sha256(value).hexdigest()
+
+
+def queued_message(
+    queued: EnqueueResult, settings: Settings
+) -> tuple[str, list[dict[str, Any]]]:
+    pending = queued.request.pending
+    item_names = ", ".join(pending.item_names)
+    request_id = queued.request.request_id[:8]
+    if queued.position <= 1:
+        position_text = "It is next to be processed."
+    else:
+        estimated_minutes = (
+            (queued.position - 1) / settings.reservation_queue_rate_per_minute
+        )
+        estimate_text = (
+            "under a minute"
+            if estimated_minutes < 1
+            else f"about {max(1, round(estimated_minutes))} minute(s)"
+        )
+        position_text = (
+            f"It is position {queued.position} in the queue; the estimated "
+            f"wait is {estimate_text}."
+        )
+    text = (
+        f"Reservation request queued for {item_names}. {position_text} "
+        f"Request ID: {request_id}."
+    )
+    return text, [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    ":hourglass_flowing_sand: *Reservation request queued*\n"
+                    f"*Items:* {_escape_mrkdwn(item_names)}\n"
+                    f"{_escape_mrkdwn(position_text)}\n"
+                    "This is not confirmed yet. I'll send the final result after "
+                    "checking the latest spreadsheet.\n"
+                    f"*Request ID:* `{request_id}`"
+                ),
+            },
+        }
+    ]
+
+
+def _deliver_queue_result(
+    client: Any,
+    *,
+    request: QueuedReservationRequest,
+    text: str,
+    blocks: list[dict[str, Any]] | None = None,
+) -> None:
+    destination = request.destination
+    if destination.mode == "update" and destination.message_ts:
+        client.chat_update(
+            channel=destination.channel_id,
+            ts=destination.message_ts,
+            text=text,
+            blocks=blocks or [],
+        )
+        return
+    kwargs: dict[str, Any] = {
+        "channel": destination.channel_id,
+        "text": text,
+    }
+    if blocks:
+        kwargs["blocks"] = blocks
+    if destination.thread_ts and not destination.channel_id.startswith("D"):
+        kwargs["thread_ts"] = destination.thread_ts
+    client.chat_postMessage(**kwargs)
 
 
 def _format_end_time(end_at: datetime, settings: Settings) -> str:
@@ -782,6 +922,9 @@ def help_text() -> str:
         "*Text reservation fallback*\n"
         "• `reserve <item> from <date/time> until <date/time>`\n"
         "• `reserve <item> until <date/time>` — start immediately\n\n"
+        "*After submitting*\n"
+        "The request is queued, then checked against the latest sheet. "
+        "Wait for the separate confirmed or failed result.\n\n"
         "*Examples*\n"
         "`reserve kayak1 from Friday at 1 PM until Friday at 3 PM`\n"
         "`reserve kayak2 until 2026-07-18 17:00`\n"

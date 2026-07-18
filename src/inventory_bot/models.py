@@ -8,6 +8,8 @@ from datetime import datetime
 
 from .errors import ParseError
 
+MAX_RESERVATION_ITEMS = 20
+
 
 @dataclass(frozen=True, slots=True)
 class Item:

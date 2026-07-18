@@ -15,7 +15,12 @@ and updates the item's current reservation state.
 - Overlap rejection, with back-to-back reservations allowed
 - Automatic activation and expiry reconciliation every 30 seconds
 - Confirm and Cancel buttons before a sheet write
-- Grouped reservations for up to 10 items with all-or-nothing conflict checks
+- Grouped reservations for up to 20 items with all-or-nothing conflict checks
+- Durable SQLite request buffering with first-in, first-out processing
+- Automatic retries, duplicate-submission protection, and restart recovery
+- Separate retries for Slack result notifications after a sheet write succeeds
+- Conservative four-reservation-per-minute default processing rate
+- A 15-second item-picker cache to reduce Google Sheets reads while users type
 - Owner-only partial cancellation through commands or Manage Reservations
 - Availability checks before confirmation and immediately before writing
 - A process-level write lock for simultaneous requests
@@ -37,7 +42,7 @@ help
 ```
 
 The preferred reservation flow is to send `reserve`, click **Open reservation
-form**, and select up to 10 items that need the same start and end time. The
+form**, and select up to 20 items that need the same start and end time. The
 combined **Start** picker defaults to now and the combined **End** picker defaults
 to one hour later. Change either the date or time directly; no separate start-mode
 choice is needed. Leaving the default Start unchanged uses the exact submission
@@ -89,6 +94,31 @@ The bot writes readable timestamps such as
 offset preserves the exact instant even if daylight-saving rules or the configured
 timezone later change. Existing ISO/UTC timestamps such as
 `2026-07-19T00:00:00Z` remain supported.
+
+## Request queue and source of truth
+
+Google Sheets remains the complete user-facing inventory and confirmed schedule
+source of truth. The bot also creates
+`.inventory_bot/reservation_queue.sqlite3` locally, but inventory maintainers do
+not need to open or manage it. That file contains only pending requests, retry
+state, duplicate-submission keys, and recent processing outcomes.
+
+When someone submits a reservation, Slack first says that the request is queued
+and explicitly not confirmed. The bot then processes requests first-in,
+first-out, rereads the latest sheet, and sends a separate confirmed or failed
+result. Overlapping requests still fail normally; the earliest queued compatible
+request wins. A multi-item request remains all-or-nothing.
+
+The default rate is four reservation groups per minute. Temporary Google errors
+are retried with increasing delays, up to eight attempts. If the bot restarts,
+requests that were waiting or processing are recovered. The queue request ID is
+also used as the confirmed sheet `group_id`, so retrying a write that actually
+succeeded cannot create a duplicate reservation. Finished, successfully
+notified queue records are retained for 30 days and then removed automatically.
+
+Do not delete the SQLite file while requests are pending. Deleting it does not
+remove reservations already confirmed in Google Sheets, but it would discard
+requests still waiting to be processed.
 
 ## 1. Create the Slack app
 
@@ -216,13 +246,13 @@ reserve
 ```
 
 Then click **Open reservation form**. The multi-select searches the current
-Google Sheet and lets the user choose up to 10 configured items. Slack displays
+Google Sheet and lets the user choose up to 20 configured items. Slack displays
 the combined datetime pickers in the user's local Slack timezone; confirmations
 and sheet timestamps use `INVENTORY_TIMEZONE`. Every selected item is checked
 again when the reservation is committed.
 
 Send `cancel` to open the cancellation launcher. The manager lists only the
-requester's active and upcoming reservations, then provides item checkboxes plus
+requester's active and upcoming reservations, then provides an item multi-select plus
 an explicitly confirmed **Cancel entire reservation** action. Send `help` at any
 time for the full command overview.
 
@@ -238,6 +268,22 @@ ALLOWED_USER_IDS=U01234567,U07654321
 ```
 
 Direct messages bypass the channel allowlist but still honor the user allowlist.
+
+The request-buffer defaults normally do not need to be changed. They can be
+overridden in `.env` when needed:
+
+```dotenv
+RESERVATION_QUEUE_DATABASE=.inventory_bot/reservation_queue.sqlite3
+RESERVATION_QUEUE_RATE_PER_MINUTE=4
+RESERVATION_QUEUE_MAX_ATTEMPTS=8
+RESERVATION_QUEUE_RETENTION_DAYS=30
+ITEM_PICKER_CACHE_SECONDS=15
+```
+
+Keep one running bot instance and store the queue on persistent local storage.
+If the bot is moved to another computer while requests are pending, stop it and
+copy the SQLite file along with its `-wal` and `-shm` companion files, or wait
+for the queue to drain before moving it.
 
 ## Supported start/end formats
 
@@ -270,8 +316,8 @@ python -m compileall -q src
 
 ## Current MVP limits
 
-- The process-level lock protects one bot instance. Do not horizontally scale the
-  bot while Google Sheets is the source of truth.
+- The SQLite queue and process-level lock protect one bot instance. Do not run
+  multiple instances against the same sheet with separate local queue files.
 - Multi-item schedule appends, live-state updates, and cancellations use batched
   Google Sheets requests, so selecting several items does not multiply the main
   API request count one-for-one.

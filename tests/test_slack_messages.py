@@ -19,14 +19,23 @@ from inventory_bot.slack_app import (
     committed_message,
     confirmation_message,
     help_text,
+    queued_message,
     status_text,
+)
+from inventory_bot.reservation_queue import (
+    EnqueueResult,
+    QueueDestination,
+    QueuedReservationRequest,
 )
 from inventory_bot.slack_views import MANAGE_RESERVATION_ACTION
 
 
 class SlackMessageTests(TestCase):
     def setUp(self) -> None:
-        self.settings = SimpleNamespace(timezone=UTC)
+        self.settings = SimpleNamespace(
+            timezone=UTC,
+            reservation_queue_rate_per_minute=4.0,
+        )
         self.end = datetime(2026, 7, 15, 22, 0, tzinfo=UTC)
 
     def test_confirmation_uses_unique_item_fields_without_quantity(self) -> None:
@@ -100,6 +109,36 @@ class SlackMessageTests(TestCase):
             MANAGE_RESERVATION_ACTION,
             blocks[1]["elements"][0]["action_id"],
         )
+
+    def test_queued_message_is_explicitly_not_a_confirmation(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1", "kayak2"),
+            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+            end_at_utc=self.end,
+            requester_user_id="U123",
+        )
+        request = QueuedReservationRequest(
+            request_id="12345678-abcd",
+            dedupe_key="event-1",
+            pending=pending,
+            reserved_by_name="Taylor Smith",
+            destination=QueueDestination("post", "D123"),
+            status="pending",
+            attempts=0,
+            notification_attempts=0,
+            submitted_at_utc=datetime(2026, 7, 15, 19, 0, tzinfo=UTC),
+            next_attempt_at_utc=datetime(2026, 7, 15, 19, 0, tzinfo=UTC),
+        )
+
+        text, blocks = queued_message(
+            EnqueueResult(request=request, created=True, position=5),
+            self.settings,
+        )
+
+        self.assertIn("position 5", text)
+        self.assertIn("kayak1, kayak2", text)
+        self.assertIn("not confirmed yet", str(blocks))
+        self.assertIn("12345678", str(blocks))
 
     def test_multi_item_confirmation_lists_every_item(self) -> None:
         pending = PendingReservation(

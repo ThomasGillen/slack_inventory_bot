@@ -113,7 +113,7 @@ class SlackViewTests(TestCase):
 
         self.assertEqual(RESERVATION_MODAL_CALLBACK, modal["callback_id"])
         self.assertEqual("multi_external_select", modal["blocks"][0]["element"]["type"])
-        self.assertEqual(10, modal["blocks"][0]["element"]["max_selected_items"])
+        self.assertEqual(20, modal["blocks"][0]["element"]["max_selected_items"])
         self.assertEqual("datetimepicker", modal["blocks"][1]["element"]["type"])
         self.assertEqual("datetimepicker", modal["blocks"][2]["element"]["type"])
         self.assertEqual(
@@ -229,16 +229,40 @@ class SlackViewTests(TestCase):
             initial_reservation_ids=("R1",),
         )
 
-        checkboxes = modal["blocks"][1]["element"]
-        self.assertEqual("checkboxes", checkboxes["type"])
-        self.assertEqual(["R1", "R2"], [value["value"] for value in checkboxes["options"]])
-        self.assertEqual(["R1"], [value["value"] for value in checkboxes["initial_options"]])
+        selector = modal["blocks"][1]["element"]
+        self.assertEqual("multi_static_select", selector["type"])
+        self.assertEqual(2, selector["max_selected_items"])
+        self.assertEqual(["R1", "R2"], [value["value"] for value in selector["options"]])
+        self.assertEqual(["R1"], [value["value"] for value in selector["initial_options"]])
         self.assertEqual(
             CANCEL_ENTIRE_GROUP_ACTION,
             modal["blocks"][2]["elements"][0]["action_id"],
         )
         metadata = CancellationModalMetadata.from_json(modal["private_metadata"])
         self.assertEqual("G1", metadata.group_id)
+
+    def test_cancellation_items_modal_supports_twenty_item_group(self) -> None:
+        group = ReservationGroup(
+            "G20",
+            tuple(
+                Reservation(
+                    f"R{index}",
+                    f"item-{index}",
+                    "Dock A",
+                    self.now + timedelta(hours=1),
+                    self.now + timedelta(hours=3),
+                    "G20",
+                )
+                for index in range(20)
+            ),
+        )
+
+        modal = build_cancellation_items_modal(group, self.settings)
+        selector = modal["blocks"][1]["element"]
+
+        self.assertEqual("multi_static_select", selector["type"])
+        self.assertEqual(20, len(selector["options"]))
+        self.assertEqual(20, selector["max_selected_items"])
 
     def test_parses_cancellation_group_and_selected_items(self) -> None:
         group_view = {
@@ -272,10 +296,3 @@ class SlackViewTests(TestCase):
             ("R1", "R2"),
             parse_cancellation_items_submission(items_view),
         )
-    OPEN_CANCELLATION_ACTION,
-    CancellationModalMetadata,
-    build_cancellation_group_modal,
-    build_cancellation_items_modal,
-    cancellation_launcher_message,
-    parse_cancellation_group_submission,
-    parse_cancellation_items_submission,
