@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime
-
-from .errors import ParseError
 
 MAX_RESERVATION_ITEMS = 20
 
@@ -65,78 +62,11 @@ class ScheduledReservation:
 
 
 @dataclass(frozen=True, slots=True)
-class ParsedReservation:
-    item_query: str
-    start_at_utc: datetime
-    end_at_utc: datetime
-
-
-@dataclass(frozen=True, slots=True)
 class PendingReservation:
     item_names: tuple[str, ...]
     end_at_utc: datetime
     requester_user_id: str
     start_at_utc: datetime | None = None
-
-    @property
-    def item_name(self) -> str:
-        return self.item_names[0]
-
-    def to_action_value(self) -> str:
-        payload = {
-            "v": 5,
-            "n": list(self.item_names),
-            "e": self.end_at_utc.isoformat(),
-            "u": self.requester_user_id,
-        }
-        if self.start_at_utc is not None:
-            payload["b"] = self.start_at_utc.isoformat()
-        value = json.dumps(payload, separators=(",", ":"))
-        if len(value) > 1900:
-            raise ParseError("The reservation confirmation is too large for Slack.")
-        return value
-
-    @classmethod
-    def from_action_value(cls, value: str) -> "PendingReservation":
-        try:
-            payload = json.loads(value)
-            version = payload.get("v")
-            if version not in {1, 2, 3, 4, 5}:
-                raise ValueError("unsupported version")
-            end_at = datetime.fromisoformat(payload["e"].replace("Z", "+00:00"))
-            if end_at.tzinfo is None:
-                raise ValueError("end time is missing a timezone")
-            start_at = None
-            if version in {4, 5} and payload.get("b"):
-                start_at = datetime.fromisoformat(payload["b"].replace("Z", "+00:00"))
-                if start_at.tzinfo is None:
-                    raise ValueError("start time is missing a timezone")
-            if version == 5:
-                raw_names = payload["n"]
-                if not isinstance(raw_names, list) or not raw_names:
-                    raise ValueError("item list is missing")
-                item_names = tuple(str(name) for name in raw_names)
-            else:
-                item_name = payload["i"] if version == 1 else payload["n"]
-                item_names = (str(item_name),)
-            return cls(
-                item_names=item_names,
-                end_at_utc=end_at,
-                requester_user_id=str(payload["u"]),
-                start_at_utc=start_at,
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise ParseError("This confirmation is invalid or has expired. Please try again.") from exc
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedReservation:
-    items: tuple[Item, ...]
-    pending: PendingReservation
-
-    @property
-    def item(self) -> Item:
-        return self.items[0]
 
 
 @dataclass(frozen=True, slots=True)

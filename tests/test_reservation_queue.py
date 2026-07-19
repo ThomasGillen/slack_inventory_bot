@@ -32,7 +32,7 @@ class FakeReservationService:
             reservations=(
                 Reservation(
                     reservation_id="reservation-1",
-                    item_name=pending.item_name,
+                    item_name=pending.item_names[0],
                     location="A",
                     start_at_utc=start_at,
                     end_at_utc=pending.end_at_utc,
@@ -69,7 +69,7 @@ class ReservationRequestQueueTests(TestCase):
             self.pending(item_name),
             dedupe_key=dedupe_key,
             reserved_by_name="Taylor Smith",
-            destination=QueueDestination("post", "D123"),
+            destination=QueueDestination("D123"),
             submitted_at_utc=submitted_at or self.now,
         )
 
@@ -83,7 +83,7 @@ class ReservationRequestQueueTests(TestCase):
         self.assertTrue(first.created)
         self.assertFalse(duplicate.created)
         self.assertEqual(first.request.request_id, duplicate.request.request_id)
-        self.assertEqual("kayak1", stored.pending.item_name)
+        self.assertEqual(("kayak1",), stored.pending.item_names)
         self.assertEqual(1, first.position)
 
     def test_fifo_order_is_stable_for_identical_submission_times(self) -> None:

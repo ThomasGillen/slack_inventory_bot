@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import re
 from datetime import datetime
-from hashlib import sha256
 from html import escape
 from typing import Any
 
@@ -14,8 +13,6 @@ from .errors import InventoryBotError
 from .models import (
     CancellationResult,
     InventoryAvailability,
-    PendingReservation,
-    PreparedReservation,
     ReservationGroup,
 )
 from .repository import InventoryRepository
@@ -125,23 +122,24 @@ def create_app(
         text = str(event.get("text", "")).strip()
         command = " ".join(text.split())
         command_without_mention = _remove_leading_mentions(command)
+        command_key = command_without_mention.casefold()
         thread_ts = None if channel_id.startswith("D") else event.get("thread_ts") or event.get("ts")
 
-        if command_without_mention.casefold() == "reserve":
+        if command_key == "reserve":
             text_response, blocks = reservation_launcher_message()
             say(text=text_response, blocks=blocks, thread_ts=thread_ts)
             return
 
-        if command_without_mention.casefold() in {"help", ""}:
+        if command_key in {"help", ""}:
             say(text=help_text(), thread_ts=thread_ts)
             return
 
-        if command_without_mention.casefold() == "cancel":
+        if command_key == "cancel":
             text_response, blocks = cancellation_launcher_message()
             say(text=text_response, blocks=blocks, thread_ts=thread_ts)
             return
 
-        if command_without_mention.casefold() == "cancel group":
+        if command_key == "cancel group":
             say(
                 text=(
                     ":warning: Use `cancel group <item>`, or send `cancel` to "
@@ -151,7 +149,7 @@ def create_app(
             )
             return
 
-        if command_without_mention.casefold().startswith("cancel "):
+        if command_key.startswith("cancel "):
             cancel_query = command_without_mention.split(maxsplit=1)[1]
             whole_group = cancel_query.casefold().startswith("group ")
             item_query = (
@@ -178,9 +176,7 @@ def create_app(
             say(text=text_response, thread_ts=thread_ts)
             return
 
-        if command_without_mention.casefold() in {"status", "availability"} or command_without_mention.casefold().startswith(
-            ("status ", "availability ")
-        ):
+        if command_key == "status" or command_key.startswith("status "):
             parts = command_without_mention.split(maxsplit=1)
             query = parts[1] if len(parts) == 2 else ""
             try:
@@ -191,21 +187,10 @@ def create_app(
             say(text=text_response, thread_ts=thread_ts)
             return
 
-        try:
-            prepared = service.prepare(
-                command_without_mention,
-                requester_user_id=user_id,
-            )
-            text_response, blocks = confirmation_message(prepared, settings)
-            say(text=text_response, blocks=blocks, thread_ts=thread_ts)
-        except InventoryBotError as exc:
-            say(text=f":warning: {exc}", thread_ts=thread_ts)
-        except Exception:
-            LOGGER.exception("Unexpected error while preparing a reservation")
-            say(
-                text=":warning: I couldn't check inventory right now. Please try again.",
-                thread_ts=thread_ts,
-            )
+        say(
+            text="I didn't recognize that command.\n\n" + help_text(),
+            thread_ts=thread_ts,
+        )
 
     @app.event("app_mention")
     def on_app_mention(
@@ -358,13 +343,8 @@ def create_app(
             queued = request_queue.enqueue(
                 pending,
                 reserved_by_name=_slack_user_name(client, user_id),
-                dedupe_key=_reservation_dedupe_key(
-                    "modal",
-                    user_id,
-                    str(view.get("id", "")),
-                ),
+                dedupe_key=f"modal:{user_id}:{view.get('id', '')}",
                 destination=QueueDestination(
-                    mode="post",
                     channel_id=destination.channel_id or user_id,
                     thread_ts=destination.thread_ts,
                 ),
@@ -500,120 +480,6 @@ def create_app(
             text=text_response,
         )
 
-    @app.action("confirm_reservation")
-    def confirm_reservation(ack: Any, body: dict[str, Any], client: Any) -> None:
-        ack()
-        actor_id = str(body.get("user", {}).get("id", ""))
-        channel_id, message_ts = _action_message_location(body)
-        try:
-            value = str(body["actions"][0]["value"])
-            pending = PendingReservation.from_action_value(value)
-            if actor_id != pending.requester_user_id:
-                _notify_actor(
-                    client,
-                    channel_id=channel_id,
-                    user_id=actor_id,
-                    text="Only the person who requested this reservation can confirm it.",
-                )
-                return
-            queued = request_queue.enqueue(
-                pending,
-                reserved_by_name=_slack_user_name(client, actor_id),
-                dedupe_key=_reservation_dedupe_key(
-                    "confirmation",
-                    actor_id,
-                    channel_id,
-                    message_ts,
-                    value,
-                ),
-                destination=QueueDestination(
-                    mode="update",
-                    channel_id=channel_id,
-                    message_ts=message_ts,
-                ),
-            )
-            if not queued.created and queued.request.status in {
-                "completed",
-                "failed",
-            }:
-                notify_queued_outcome(queued.request)
-                return
-            text_response, blocks = queued_message(queued, settings)
-            client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                text=text_response,
-                blocks=blocks,
-            )
-        except InventoryBotError as exc:
-            client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                text=f"Reservation request not queued: {exc}",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f":warning: *Reservation request not queued*\n{_escape_mrkdwn(str(exc))}",
-                        },
-                    }
-                ],
-            )
-        except Exception:
-            LOGGER.exception("Unable to queue a reservation")
-            client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                text="Reservation request could not be safely queued.",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": ":warning: *Reservation request not queued*\nPlease try the command again.",
-                        },
-                    }
-                ],
-            )
-
-    @app.action("cancel_reservation")
-    def cancel_reservation(ack: Any, body: dict[str, Any], client: Any) -> None:
-        ack()
-        actor_id = str(body.get("user", {}).get("id", ""))
-        channel_id, message_ts = _action_message_location(body)
-        try:
-            pending = PendingReservation.from_action_value(str(body["actions"][0]["value"]))
-            if actor_id != pending.requester_user_id:
-                _notify_actor(
-                    client,
-                    channel_id=channel_id,
-                    user_id=actor_id,
-                    text="Only the person who requested this reservation can cancel it.",
-                )
-                return
-            client.chat_update(
-                channel=channel_id,
-                ts=message_ts,
-                text="Reservation request cancelled.",
-                blocks=[
-                    {
-                        "type": "section",
-                        "text": {
-                            "type": "mrkdwn",
-                            "text": f":x: Reservation request cancelled by <@{actor_id}>.",
-                        },
-                    }
-                ],
-            )
-        except InventoryBotError as exc:
-            _notify_actor(
-                client,
-                channel_id=channel_id,
-                user_id=actor_id,
-                text=str(exc),
-            )
-
     setattr(app, "_inventory_service", service)
     setattr(app, "_reservation_request_queue", request_queue)
     setattr(app, "_reservation_queue_worker", queue_worker)
@@ -646,11 +512,6 @@ def _slack_user_name(client: Any, user_id: str) -> str:
     except Exception:
         LOGGER.exception("Unable to look up Slack profile for %s", user_id)
     return user_id
-
-
-def _reservation_dedupe_key(kind: str, *parts: str) -> str:
-    value = "\x1f".join((kind, *parts)).encode("utf-8")
-    return sha256(value).hexdigest()
 
 
 def queued_message(
@@ -704,14 +565,6 @@ def _deliver_queue_result(
     blocks: list[dict[str, Any]] | None = None,
 ) -> None:
     destination = request.destination
-    if destination.mode == "update" and destination.message_ts:
-        client.chat_update(
-            channel=destination.channel_id,
-            ts=destination.message_ts,
-            text=text,
-            blocks=blocks or [],
-        )
-        return
     kwargs: dict[str, Any] = {
         "channel": destination.channel_id,
         "text": text,
@@ -729,57 +582,6 @@ def _format_end_time(end_at: datetime, settings: Settings) -> str:
 
 def _escape_mrkdwn(value: str) -> str:
     return escape(value, quote=False)
-
-
-def confirmation_message(
-    prepared: PreparedReservation, settings: Settings
-) -> tuple[str, list[dict[str, Any]]]:
-    item_names = ", ".join(item.item_name for item in prepared.items)
-    item_lines = _format_prepared_items(prepared)
-    start_text = (
-        _format_end_time(prepared.pending.start_at_utc, settings)
-        if prepared.pending.start_at_utc is not None
-        else "Immediately after confirmation"
-    )
-    end_text = _format_end_time(prepared.pending.end_at_utc, settings)
-    value = prepared.pending.to_action_value()
-    text = (
-        f"Confirm reservation for {item_names} from {start_text} "
-        f"until {end_text}."
-    )
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*Confirm reservation*\n"
-                    f"*Items ({len(prepared.items)}):*\n{item_lines}\n"
-                    f"*Starts:* {_escape_mrkdwn(start_text)}\n"
-                    f"*Ends:* {_escape_mrkdwn(end_text)}"
-                ),
-            },
-        },
-        {
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Confirm"},
-                    "style": "primary",
-                    "action_id": "confirm_reservation",
-                    "value": value,
-                },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "Cancel"},
-                    "action_id": "cancel_reservation",
-                    "value": value,
-                },
-            ],
-        },
-    ]
-    return text, blocks
 
 
 def committed_message(
@@ -851,16 +653,6 @@ def cancellation_result_message(
     return message
 
 
-def _format_prepared_items(prepared: PreparedReservation) -> str:
-    return "\n".join(
-        (
-            f"• *{_escape_mrkdwn(item.item_name)}* — "
-            f"{_escape_mrkdwn(item.location or 'Location not specified')}"
-        )
-        for item in prepared.items
-    )
-
-
 def status_text(
     statuses: list[InventoryAvailability], settings: Settings
 ) -> str:
@@ -919,31 +711,11 @@ def help_text() -> str:
         "• `status` — show all inventory availability\n"
         "• `status <item>` — show one item's availability\n"
         "• `help` — show this command overview\n\n"
-        "*Text reservation fallback*\n"
-        "• `reserve <item> from <date/time> until <date/time>`\n"
-        "• `reserve <item> until <date/time>` — start immediately\n\n"
-        "*After submitting*\n"
+        "*Reservation process*\n"
+        "Send `reserve`, open the form, choose the items and times, then submit. "
         "The request is queued, then checked against the latest sheet. "
-        "Wait for the separate confirmed or failed result.\n\n"
-        "*Examples*\n"
-        "`reserve kayak1 from Friday at 1 PM until Friday at 3 PM`\n"
-        "`reserve kayak2 until 2026-07-18 17:00`\n"
-        "`cancel kayak1`"
+        "Wait for the separate confirmed or failed result."
     )
-
-
-def _action_message_location(body: dict[str, Any]) -> tuple[str, str]:
-    channel_id = str(
-        body.get("channel", {}).get("id")
-        or body.get("container", {}).get("channel_id")
-        or ""
-    )
-    message_ts = str(
-        body.get("message", {}).get("ts")
-        or body.get("container", {}).get("message_ts")
-        or ""
-    )
-    return channel_id, message_ts
 
 
 def _notify_actor(client: Any, *, channel_id: str, user_id: str, text: str) -> None:

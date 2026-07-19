@@ -124,10 +124,8 @@ def _group_from_json(value: str | None) -> ReservationGroup | None:
 class QueueDestination:
     """Where the eventual Slack result should be delivered."""
 
-    mode: str
     channel_id: str
     thread_ts: str = ""
-    message_ts: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,10 +255,10 @@ class ReservationRequestQueue:
                         dedupe_key,
                         _pending_to_json(pending),
                         reserved_by_name,
-                        destination.mode,
+                        "post",
                         destination.channel_id,
                         destination.thread_ts,
-                        destination.message_ts,
+                        "",
                         _timestamp(now),
                         _timestamp(now),
                         _timestamp(now),
@@ -534,10 +532,8 @@ class ReservationRequestQueue:
             pending=_pending_from_json(str(row["pending_json"])),
             reserved_by_name=str(row["reserved_by_name"]),
             destination=QueueDestination(
-                mode=str(row["destination_mode"]),
                 channel_id=str(row["channel_id"]),
                 thread_ts=str(row["thread_ts"]),
-                message_ts=str(row["message_ts"]),
             ),
             status=str(row["status"]),
             attempts=int(row["attempts"]),

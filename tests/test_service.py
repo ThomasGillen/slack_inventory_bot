@@ -100,16 +100,25 @@ class ReservationServiceTests(TestCase):
             clock=lambda: self.now,
         )
 
-    def prepare(self, *, text: str = "reserve kayak1 until tomorrow at 3 PM"):
-        return self.service.prepare(
-            text,
-            requester_user_id="U123",
+    def pending(
+        self,
+        *,
+        item_names: tuple[str, ...] = ("kayak1",),
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        requester_user_id: str = "U123",
+    ) -> PendingReservation:
+        return PendingReservation(
+            item_names=item_names,
+            start_at_utc=start_at,
+            end_at_utc=end_at or self.now + timedelta(hours=2),
+            requester_user_id=requester_user_id,
         )
 
-    def test_prepare_and_commit_updates_current_item_state(self) -> None:
-        prepared = self.prepare()
+    def test_commit_updates_current_item_state(self) -> None:
+        pending = self.pending()
         reservation = self.service.commit(
-            prepared.pending, reserved_by_name="Taylor Smith"
+            pending, reserved_by_name="Taylor Smith"
         )
 
         updated = self.repository.items[0]
@@ -149,38 +158,27 @@ class ReservationServiceTests(TestCase):
         self.assertTrue(statuses[0].available)
         self.assertIsNone(self.repository.items[0].reservation_end_utc)
 
-    def test_prepare_rejects_currently_reserved_item(self) -> None:
+    def test_commit_rejects_currently_reserved_item(self) -> None:
         self.repository.items[0] = replace(
             self.repository.items[0],
             reservation_end_utc=self.now + timedelta(hours=1),
         )
 
         with self.assertRaisesRegex(AvailabilityError, "reserved until"):
-            self.prepare()
+            self.service.commit(self.pending())
 
-    def test_commit_rechecks_current_state(self) -> None:
-        prepared = self.prepare()
-        self.repository.items[0] = replace(
-            self.repository.items[0],
-            reservation_end_utc=self.now + timedelta(hours=1),
-            reserved_by="U999",
-        )
+    def test_second_commit_cannot_overwrite_active_reservation(self) -> None:
+        pending = self.pending()
+        self.service.commit(pending)
 
         with self.assertRaises(AvailabilityError):
-            self.service.commit(prepared.pending)
-
-    def test_second_confirmation_cannot_overwrite_active_reservation(self) -> None:
-        prepared = self.prepare()
-        self.service.commit(prepared.pending)
-
-        with self.assertRaises(AvailabilityError):
-            self.service.commit(prepared.pending)
+            self.service.commit(pending)
 
     def test_partial_item_match_must_be_unambiguous(self) -> None:
         self.repository.items.append(Item("kayak3", "A"))
 
         with self.assertRaises(AmbiguousItemError):
-            self.prepare(text="reserve kayak until tomorrow at 3 PM")
+            self.service.inventory_status("kayak")
 
     def test_inventory_picker_includes_items_regardless_of_current_state(self) -> None:
         self.repository.items[1] = replace(
@@ -195,8 +193,7 @@ class ReservationServiceTests(TestCase):
         self.assertEqual(["kayak1", "kayak2"], [item.item_name for item in items])
 
     def test_reserver_can_cancel_active_reservation(self) -> None:
-        prepared = self.prepare()
-        self.service.commit(prepared.pending, reserved_by_name="Taylor Smith")
+        self.service.commit(self.pending(), reserved_by_name="Taylor Smith")
 
         result = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
@@ -208,8 +205,7 @@ class ReservationServiceTests(TestCase):
         self.assertEqual([], self.repository.reservations)
 
     def test_different_user_cannot_cancel_reservation(self) -> None:
-        prepared = self.prepare()
-        self.service.commit(prepared.pending, reserved_by_name="Taylor Smith")
+        self.service.commit(self.pending(), reserved_by_name="Taylor Smith")
 
         with self.assertRaisesRegex(CancellationError, "Only the person"):
             self.service.cancel(
@@ -217,8 +213,7 @@ class ReservationServiceTests(TestCase):
             )
 
     def test_legacy_slack_id_owner_can_still_cancel(self) -> None:
-        prepared = self.prepare()
-        self.service.commit(prepared.pending)
+        self.service.commit(self.pending())
 
         result = self.service.cancel(
             "kayak1", requester_user_id="U123", requester_name="Taylor Smith"
@@ -231,15 +226,13 @@ class ReservationServiceTests(TestCase):
             self.service.cancel("kayak1", requester_user_id="U123")
 
     def test_future_reservation_does_not_activate_item_early(self) -> None:
-        prepared = self.prepare(
-            text=(
-                "reserve kayak1 from tomorrow at 1 PM "
-                "until tomorrow at 3 PM"
-            )
+        pending = self.pending(
+            start_at=self.now + timedelta(hours=22),
+            end_at=self.now + timedelta(hours=24),
         )
 
         reservation = self.service.commit(
-            prepared.pending, reserved_by_name="Taylor Smith"
+            pending, reserved_by_name="Taylor Smith"
         )
 
         self.assertGreater(reservation.start_at_utc, self.now)
@@ -247,55 +240,54 @@ class ReservationServiceTests(TestCase):
         self.assertEqual(1, len(self.repository.reservations))
 
     def test_overlapping_future_reservation_is_rejected(self) -> None:
-        first = self.prepare(
-            text=(
-                "reserve kayak1 from tomorrow at 1 PM "
-                "until tomorrow at 3 PM"
-            )
+        first = self.pending(
+            start_at=self.now + timedelta(hours=22),
+            end_at=self.now + timedelta(hours=24),
         )
-        self.service.commit(first.pending, reserved_by_name="Taylor Smith")
+        self.service.commit(first, reserved_by_name="Taylor Smith")
 
         with self.assertRaisesRegex(AvailabilityError, "already reserved from"):
-            self.service.prepare(
-                "reserve kayak1 from tomorrow at 2 PM until tomorrow at 4 PM",
-                requester_user_id="U999",
+            self.service.commit(
+                self.pending(
+                    start_at=self.now + timedelta(hours=23),
+                    end_at=self.now + timedelta(hours=25),
+                    requester_user_id="U999",
+                ),
+                reserved_by_name="Morgan Jones",
             )
 
     def test_commit_rechecks_future_schedule_for_overlap(self) -> None:
-        prepared = self.prepare(
-            text=(
-                "reserve kayak1 from tomorrow at 1 PM "
-                "until tomorrow at 3 PM"
-            )
+        pending = self.pending(
+            start_at=self.now + timedelta(hours=22),
+            end_at=self.now + timedelta(hours=24),
         )
         self.repository.reservations.append(
             ScheduledReservation(
                 "R-other",
                 "kayak1",
-                prepared.pending.start_at_utc + timedelta(minutes=30),
-                prepared.pending.end_at_utc + timedelta(hours=1),
+                pending.start_at_utc + timedelta(minutes=30),
+                pending.end_at_utc + timedelta(hours=1),
                 "Morgan Jones",
                 "U999",
             )
         )
 
         with self.assertRaises(AvailabilityError):
-            self.service.commit(prepared.pending, reserved_by_name="Taylor Smith")
+            self.service.commit(pending, reserved_by_name="Taylor Smith")
 
     def test_back_to_back_reservations_are_allowed(self) -> None:
-        first = self.prepare(
-            text=(
-                "reserve kayak1 from tomorrow at 1 PM "
-                "until tomorrow at 3 PM"
-            )
+        first = self.pending(
+            start_at=self.now + timedelta(hours=22),
+            end_at=self.now + timedelta(hours=24),
         )
-        self.service.commit(first.pending, reserved_by_name="Taylor Smith")
-        second = self.service.prepare(
-            "reserve kayak1 from tomorrow at 3 PM until tomorrow at 4 PM",
+        self.service.commit(first, reserved_by_name="Taylor Smith")
+        second = self.pending(
+            start_at=self.now + timedelta(hours=24),
+            end_at=self.now + timedelta(hours=25),
             requester_user_id="U999",
         )
 
-        self.service.commit(second.pending, reserved_by_name="Morgan Jones")
+        self.service.commit(second, reserved_by_name="Morgan Jones")
 
         self.assertEqual(2, len(self.repository.reservations))
 

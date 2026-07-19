@@ -1,4 +1,3 @@
-import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest import TestCase
@@ -8,7 +7,6 @@ from inventory_bot.models import (
     InventoryAvailability,
     Item,
     PendingReservation,
-    PreparedReservation,
     Reservation,
     ReservationGroup,
     ScheduledReservation,
@@ -17,7 +15,6 @@ from inventory_bot.slack_app import (
     _slack_user_name,
     cancellation_result_message,
     committed_message,
-    confirmation_message,
     help_text,
     queued_message,
     status_text,
@@ -37,57 +34,6 @@ class SlackMessageTests(TestCase):
             reservation_queue_rate_per_minute=4.0,
         )
         self.end = datetime(2026, 7, 15, 22, 0, tzinfo=UTC)
-
-    def test_confirmation_uses_unique_item_fields_without_quantity(self) -> None:
-        item = Item("kayak1", "A")
-        pending = PendingReservation(
-            item_names=("kayak1",),
-            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
-            end_at_utc=self.end,
-            requester_user_id="U123",
-        )
-
-        text, blocks = confirmation_message(
-            PreparedReservation(items=(item,), pending=pending),
-            self.settings,
-        )
-
-        self.assertIn("kayak1", text)
-        self.assertNotIn("Quantity", str(blocks))
-        self.assertEqual("confirm_reservation", blocks[1]["elements"][0]["action_id"])
-
-    def test_pending_reservation_keeps_old_button_payload_compatibility(self) -> None:
-        old_value = json.dumps(
-            {
-                "v": 2,
-                "n": "kayak1",
-                "e": self.end.isoformat(),
-                "u": "U123",
-                "s": "Ev1",
-                "c": "C1",
-                "m": "123.456",
-            }
-        )
-
-        pending = PendingReservation.from_action_value(old_value)
-
-        self.assertEqual("kayak1", pending.item_name)
-        self.assertEqual(self.end, pending.end_at_utc)
-        self.assertEqual("U123", pending.requester_user_id)
-
-    def test_new_button_payload_contains_only_required_fields(self) -> None:
-        pending = PendingReservation(
-            ("kayak1", "kayak2"),
-            self.end,
-            "U123",
-            datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
-        )
-
-        payload = json.loads(pending.to_action_value())
-
-        self.assertEqual({"v", "n", "b", "e", "u"}, set(payload))
-        self.assertEqual(5, payload["v"])
-        self.assertEqual(["kayak1", "kayak2"], payload["n"])
 
     def test_committed_message_contains_item_and_end_time(self) -> None:
         reservation = Reservation(
@@ -122,7 +68,7 @@ class SlackMessageTests(TestCase):
             dedupe_key="event-1",
             pending=pending,
             reserved_by_name="Taylor Smith",
-            destination=QueueDestination("post", "D123"),
+            destination=QueueDestination("D123"),
             status="pending",
             attempts=0,
             notification_attempts=0,
@@ -140,27 +86,6 @@ class SlackMessageTests(TestCase):
         self.assertIn("not confirmed yet", str(blocks))
         self.assertIn("12345678", str(blocks))
 
-    def test_multi_item_confirmation_lists_every_item(self) -> None:
-        pending = PendingReservation(
-            item_names=("kayak1", "kayak2"),
-            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
-            end_at_utc=self.end,
-            requester_user_id="U123",
-        )
-
-        text, blocks = confirmation_message(
-            PreparedReservation(
-                items=(Item("kayak1", "A"), Item("kayak2", "B")),
-                pending=pending,
-            ),
-            self.settings,
-        )
-
-        self.assertIn("kayak1, kayak2", text)
-        self.assertIn("Items (2)", str(blocks))
-        self.assertIn("kayak1", str(blocks))
-        self.assertIn("kayak2", str(blocks))
-
     def test_status_shows_current_owner_and_end_time(self) -> None:
         item = Item("kayak1", "A", self.end, "U123")
 
@@ -171,12 +96,13 @@ class SlackMessageTests(TestCase):
         self.assertIn("reserved until", text)
         self.assertIn("<@U123>", text)
 
-    def test_help_includes_cancel_command(self) -> None:
+    def test_help_lists_only_supported_commands(self) -> None:
+        self.assertIn("`reserve`", help_text())
         self.assertIn("`cancel`", help_text())
         self.assertIn("cancel <item>", help_text())
         self.assertIn("cancel group <item>", help_text())
         self.assertIn("`help`", help_text())
-        self.assertIn("from <date/time>", help_text())
+        self.assertNotIn("from <date/time>", help_text())
 
     def test_cancellation_message_lists_cancelled_and_remaining_items(self) -> None:
         start = datetime(2026, 7, 15, 20, 0, tzinfo=UTC)

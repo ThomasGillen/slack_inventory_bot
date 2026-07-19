@@ -21,12 +21,10 @@ from .models import (
     Item,
     MAX_RESERVATION_ITEMS,
     PendingReservation,
-    PreparedReservation,
     Reservation,
     ReservationGroup,
     ScheduledReservation,
 )
-from .parser import parse_reservation_message
 from .repository import InventoryRepository
 
 
@@ -56,31 +54,6 @@ class ReservationService:
         self._inventory_cache: list[Item] = []
         self._inventory_cache_loaded_at = 0.0
         self._inventory_cache_loaded = False
-
-    def prepare(
-        self,
-        text: str,
-        *,
-        requester_user_id: str,
-    ) -> PreparedReservation:
-        now = self._now()
-        parsed = parse_reservation_message(
-            text,
-            timezone=self.timezone,
-            now=now.astimezone(self.timezone),
-        )
-        item = self._resolve_item(parsed.item_query, self.repository.list_items())
-        if not self._is_available(item, now):
-            raise AvailabilityError(self._reserved_message(item))
-
-        pending = PendingReservation(
-            item_names=(item.item_name,),
-            start_at_utc=parsed.start_at_utc,
-            end_at_utc=parsed.end_at_utc,
-            requester_user_id=requester_user_id,
-        )
-        self._assert_no_overlap(item, pending, now, self.repository.list_reservations())
-        return PreparedReservation(items=(item,), pending=pending)
 
     def commit(
         self,

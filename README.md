@@ -1,8 +1,8 @@
 # Slack Inventory Bot
 
-A Slack bot that accepts reservations in a direct message or an
-`@InventoryBot` channel mention, checks a Google Sheet, asks for confirmation,
-and updates the item's current reservation state.
+A Slack bot that opens a reservation form from a direct message or an
+`@InventoryBot` channel mention, queues the request, and updates a Google
+Sheet-backed inventory schedule.
 
 ## What is implemented
 
@@ -14,7 +14,6 @@ and updates the item's current reservation state.
 - Immediate and future reservation scheduling
 - Overlap rejection, with back-to-back reservations allowed
 - Automatic activation and expiry reconciliation every 30 seconds
-- Confirm and Cancel buttons before a sheet write
 - Grouped reservations for up to 20 items with all-or-nothing conflict checks
 - Durable SQLite request buffering with first-in, first-out processing
 - Automatic retries, duplicate-submission protection, and restart recovery
@@ -22,18 +21,16 @@ and updates the item's current reservation state.
 - Conservative four-reservation-per-minute default processing rate
 - A 15-second item-picker cache to reduce Google Sheets reads while users type
 - Owner-only partial cancellation through commands or Manage Reservations
-- Availability checks before confirmation and immediately before writing
+- Availability checks against the latest sheet immediately before writing
 - A process-level write lock for simultaneous requests
 - `status` and `status <item>` availability commands
 - `help` command with a complete command overview
 - Readable, timezone-qualified sheet times using `INVENTORY_TIMEZONE`
 
-Example requests:
+Supported commands:
 
 ```text
-reserve kayak1 from Friday at 1 PM until Friday at 3 PM
-reserve kayak2 until tomorrow at 5 PM
-reserve kayak3 until 2026-07-18 17:00
+reserve
 status
 status kayak1
 cancel kayak1
@@ -41,12 +38,12 @@ cancel group kayak1
 help
 ```
 
-The preferred reservation flow is to send `reserve`, click **Open reservation
+The reservation flow is to send `reserve`, click **Open reservation
 form**, and select up to 20 items that need the same start and end time. The
 combined **Start** picker defaults to now and the combined **End** picker defaults
 to one hour later. Change either the date or time directly; no separate start-mode
 choice is needed. Leaving the default Start unchanged uses the exact submission
-time. The full text form remains available as a single-item fallback.
+time.
 
 ## Availability model
 
@@ -285,29 +282,10 @@ If the bot is moved to another computer while requests are pending, stop it and
 copy the SQLite file along with its `-wal` and `-shm` companion files, or wait
 for the queue to drain before moving it.
 
-## Supported start/end formats
-
-- `tomorrow at 3 PM`
-- `Friday at 3 PM`
-- `in 4 hours`
-- `July 18 at 5 PM`
-- `2026-07-18 17:00`
-- ISO 8601 timestamps, including explicit offsets
-
-Times without an explicit offset are interpreted using `INVENTORY_TIMEZONE`.
-Ambiguous, invalid, or past times are rejected rather than guessed.
-
-The text form accepts either an explicit start or an immediate reservation:
-
-```text
-reserve kayak1 from tomorrow at 1 PM until tomorrow at 3 PM
-reserve kayak1 until tomorrow at 3 PM
-```
-
 ## Tests
 
-The parser and reservation service use only the Python standard library, so their
-tests can run even before installing Slack or Google packages:
+Run the automated tests and source compilation checks from the configured
+environment:
 
 ```powershell
 python -m unittest discover -v
