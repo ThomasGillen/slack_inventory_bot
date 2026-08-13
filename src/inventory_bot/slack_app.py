@@ -85,14 +85,7 @@ def create_app(
     )
 
     def notify_queued_outcome(request: QueuedReservationRequest) -> None:
-        if request.status == "completed" and request.result is not None:
-            text_response, blocks = committed_message(request.result, settings)
-        else:
-            text_response = (
-                ":warning: Reservation not recorded: "
-                f"{request.last_error or 'The request could not be completed.'}"
-            )
-            blocks = None
+        text_response, blocks = queue_outcome_message(request, settings)
         _deliver_queue_result(
             app.client,
             request=request,
@@ -109,43 +102,47 @@ def create_app(
         retention_days=settings.reservation_queue_retention_days,
     )
 
-    def handle_message(event: dict[str, Any], say: Any, client: Any) -> None:
+    def handle_message(event: dict[str, Any], client: Any) -> None:
         if event.get("bot_id") or event.get("subtype") or not event.get("user"):
             return
 
         user_id = str(event["user"])
         channel_id = str(event.get("channel", ""))
         if not settings.user_allowed(user_id) or not settings.channel_allowed(channel_id):
-            say(text="You are not allowed to make inventory reservations here.")
+            _reply_to_event(
+                client,
+                event=event,
+                text="You are not allowed to make inventory reservations here.",
+            )
             return
 
         text = str(event.get("text", "")).strip()
         command = " ".join(text.split())
         command_without_mention = _remove_leading_mentions(command)
         command_key = command_without_mention.casefold()
-        thread_ts = None if channel_id.startswith("D") else event.get("thread_ts") or event.get("ts")
 
         if command_key == "reserve":
             text_response, blocks = reservation_launcher_message()
-            say(text=text_response, blocks=blocks, thread_ts=thread_ts)
+            _reply_to_event(client, event=event, text=text_response, blocks=blocks)
             return
 
         if command_key in {"help", ""}:
-            say(text=help_text(), thread_ts=thread_ts)
+            _reply_to_event(client, event=event, text=help_text())
             return
 
         if command_key == "cancel":
             text_response, blocks = cancellation_launcher_message()
-            say(text=text_response, blocks=blocks, thread_ts=thread_ts)
+            _reply_to_event(client, event=event, text=text_response, blocks=blocks)
             return
 
         if command_key == "cancel group":
-            say(
+            _reply_to_event(
+                client,
+                event=event,
                 text=(
                     ":warning: Use `cancel group <item>`, or send `cancel` to "
                     "choose a reservation in the manager."
                 ),
-                thread_ts=thread_ts,
             )
             return
 
@@ -173,7 +170,7 @@ def create_app(
                 text_response = (
                     ":warning: I couldn't cancel that reservation right now. Please try again."
                 )
-            say(text=text_response, thread_ts=thread_ts)
+            _reply_to_event(client, event=event, text=text_response)
             return
 
         if command_key == "status" or command_key.startswith("status "):
@@ -184,26 +181,23 @@ def create_app(
                 text_response = status_text(statuses, settings)
             except InventoryBotError as exc:
                 text_response = f":warning: {exc}"
-            say(text=text_response, thread_ts=thread_ts)
+            _reply_to_event(client, event=event, text=text_response)
             return
 
-        say(
+        _reply_to_event(
+            client,
+            event=event,
             text="I didn't recognize that command.\n\n" + help_text(),
-            thread_ts=thread_ts,
         )
 
     @app.event("app_mention")
-    def on_app_mention(
-        event: dict[str, Any], say: Any, client: Any
-    ) -> None:
-        handle_message(event, say, client)
+    def on_app_mention(event: dict[str, Any], client: Any) -> None:
+        handle_message(event, client)
 
     @app.event("message")
-    def on_direct_message(
-        event: dict[str, Any], say: Any, client: Any
-    ) -> None:
+    def on_direct_message(event: dict[str, Any], client: Any) -> None:
         if event.get("channel_type") == "im" or str(event.get("channel", "")).startswith("D"):
-            handle_message(event, say, client)
+            handle_message(event, client)
 
     def open_reservation_modal(body: dict[str, Any], client: Any) -> None:
         user_id = str(body.get("user", {}).get("id", ""))
@@ -349,15 +343,14 @@ def create_app(
                     thread_ts=destination.thread_ts,
                 ),
             )
-            if queued.created:
-                text_response, blocks = queued_message(queued, settings)
-                _post_modal_result(
-                    client,
-                    destination=destination,
-                    user_id=user_id,
-                    text=text_response,
-                    blocks=blocks,
-                )
+            text_response, blocks = queued_submission_message(queued, settings)
+            _post_modal_result(
+                client,
+                destination=destination,
+                user_id=user_id,
+                text=text_response,
+                blocks=blocks,
+            )
         except Exception:
             LOGGER.exception("Unable to queue a modal reservation")
             _post_modal_result(
@@ -493,6 +486,27 @@ def _remove_leading_mentions(text: str) -> str:
     return " ".join(parts)
 
 
+def _reply_to_event(
+    client: Any,
+    *,
+    event: dict[str, Any],
+    text: str,
+    blocks: list[dict[str, Any]] | None = None,
+) -> None:
+    """Post a response using only the current event's destination data."""
+    channel_id = str(event.get("channel", ""))
+    if not channel_id:
+        raise ValueError("Slack message event is missing its channel ID.")
+    kwargs: dict[str, Any] = {"channel": channel_id, "text": text}
+    if blocks:
+        kwargs["blocks"] = blocks
+    if not channel_id.startswith("D"):
+        thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+    client.chat_postMessage(**kwargs)
+
+
 def _slack_user_name(client: Any, user_id: str) -> str:
     """Return a sheet-friendly Slack name, falling back to the stable user ID."""
     try:
@@ -555,6 +569,27 @@ def queued_message(
             },
         }
     ]
+
+
+def queue_outcome_message(
+    request: QueuedReservationRequest, settings: Settings
+) -> tuple[str, list[dict[str, Any]] | None]:
+    if request.status == "completed" and request.result is not None:
+        return committed_message(request.result, settings)
+    return (
+        ":warning: Reservation not recorded: "
+        f"{request.last_error or 'The request could not be completed.'}",
+        None,
+    )
+
+
+def queued_submission_message(
+    queued: EnqueueResult, settings: Settings
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """Return a response for both new submissions and Slack redeliveries."""
+    if queued.request.status in {"pending", "retry", "processing"}:
+        return queued_message(queued, settings)
+    return queue_outcome_message(queued.request, settings)
 
 
 def _deliver_queue_result(

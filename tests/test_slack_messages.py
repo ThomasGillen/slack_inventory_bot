@@ -12,11 +12,13 @@ from inventory_bot.models import (
     ScheduledReservation,
 )
 from inventory_bot.slack_app import (
+    _reply_to_event,
     _slack_user_name,
     cancellation_result_message,
     committed_message,
     help_text,
     queued_message,
+    queued_submission_message,
     status_text,
 )
 from inventory_bot.reservation_queue import (
@@ -34,6 +36,52 @@ class SlackMessageTests(TestCase):
             reservation_queue_rate_per_minute=4.0,
         )
         self.end = datetime(2026, 7, 15, 22, 0, tzinfo=UTC)
+
+    def test_consecutive_replies_use_each_current_event(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.messages = []
+
+            def chat_postMessage(self, **kwargs):
+                self.messages.append(kwargs)
+
+        client = Client()
+
+        _reply_to_event(
+            client,
+            event={"channel": "C123", "ts": "100.001"},
+            text="first response",
+        )
+        _reply_to_event(
+            client,
+            event={"channel": "C123", "ts": "100.002"},
+            text="second response",
+        )
+
+        self.assertEqual(
+            ["100.001", "100.002"],
+            [message["thread_ts"] for message in client.messages],
+        )
+        self.assertEqual(
+            ["first response", "second response"],
+            [message["text"] for message in client.messages],
+        )
+
+    def test_direct_message_reply_does_not_reuse_a_thread(self) -> None:
+        class Client:
+            def chat_postMessage(self, **kwargs):
+                self.message = kwargs
+
+        client = Client()
+
+        _reply_to_event(
+            client,
+            event={"channel": "D123", "ts": "100.001"},
+            text="current response",
+        )
+
+        self.assertEqual("D123", client.message["channel"])
+        self.assertNotIn("thread_ts", client.message)
 
     def test_committed_message_contains_item_and_end_time(self) -> None:
         reservation = Reservation(
@@ -85,6 +133,34 @@ class SlackMessageTests(TestCase):
         self.assertIn("kayak1, kayak2", text)
         self.assertIn("not confirmed yet", str(blocks))
         self.assertIn("12345678", str(blocks))
+
+    def test_duplicate_pending_submission_still_gets_a_response(self) -> None:
+        pending = PendingReservation(
+            item_names=("kayak1",),
+            start_at_utc=datetime(2026, 7, 15, 20, 0, tzinfo=UTC),
+            end_at_utc=self.end,
+            requester_user_id="U123",
+        )
+        request = QueuedReservationRequest(
+            request_id="12345678-abcd",
+            dedupe_key="event-1",
+            pending=pending,
+            reserved_by_name="Taylor Smith",
+            destination=QueueDestination("D123"),
+            status="pending",
+            attempts=0,
+            notification_attempts=0,
+            submitted_at_utc=datetime(2026, 7, 15, 19, 0, tzinfo=UTC),
+            next_attempt_at_utc=datetime(2026, 7, 15, 19, 0, tzinfo=UTC),
+        )
+
+        text, blocks = queued_submission_message(
+            EnqueueResult(request=request, created=False, position=1),
+            self.settings,
+        )
+
+        self.assertIn("queued", text)
+        self.assertIsNotNone(blocks)
 
     def test_status_shows_current_owner_and_end_time(self) -> None:
         item = Item("kayak1", "A", self.end, "U123")
