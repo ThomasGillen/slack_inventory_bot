@@ -1,346 +1,291 @@
 # Slack Inventory Bot
 
-A Slack bot that opens a reservation form from a direct message or an
-`@InventoryBot` channel mention, queues the request, and updates a Google
-Sheet-backed inventory schedule.
+A Slack reservation service backed by a Google Sheets inventory schedule. Users
+can open a reservation form from a direct message, an `@InventoryBot` channel
+mention, or a global Slack shortcut; the bot queues the request, checks the latest
+schedule, and reports a separate confirmed or failed result.
 
-## What is implemented
+> Setting up a new machine or workspace? Follow the complete
+> [Windows 10/11 setup guide](SETUP.md).
 
-- Direct messages through Slack's `message.im` event
-- Channel requests through the `app_mention` event
-- Block Kit reservation modal with a multi-item search plus combined Start and End datetime pickers
+## What the bot provides
+
+- Direct-message handling through Slack's `message.im` event
+- Channel handling through the `app_mention` event
 - Global **Reserve an item** Slack shortcut
-- One unique inventory item per sheet row
-- Immediate and future reservation scheduling
-- Overlap rejection, with back-to-back reservations allowed
-- Automatic activation and expiry reconciliation every 30 seconds
-- Grouped reservations for up to 20 items with all-or-nothing conflict checks
-- Durable SQLite request buffering with first-in, first-out processing
-- Automatic retries, duplicate-submission protection, and restart recovery
-- Separate retries for Slack result notifications after a sheet write succeeds
-- Conservative four-reservation-per-minute default processing rate
-- A 15-second item-picker cache to reduce Google Sheets reads while users type
-- Owner-only partial cancellation through commands or Manage Reservations
-- Availability checks against the latest sheet immediately before writing
-- A process-level write lock for simultaneous requests
-- `status` and `status <item>` availability commands
-- `help` command with a complete command overview
-- Readable, timezone-qualified sheet times using `INVENTORY_TIMEZONE`
+- Block Kit reservation modal with searchable multi-item selection
+- Combined Start and End date/time pickers
+- Immediate and future reservations
+- Grouped reservations for up to 20 items
+- All-or-nothing conflict checking for multi-item requests
+- Owner-safe partial or whole-group cancellation
+- Current and upcoming availability reporting
+- Durable first-in, first-out request buffering in SQLite
+- Automatic retry, duplicate-submission protection, and restart recovery
+- Separate Slack-notification retries after a successful sheet write
+- Automatic activation and expiration reconciliation every 30 seconds
+- A short item-picker cache to reduce Google Sheets reads while users type
+- Optional Slack channel and user allowlists
 
-Supported commands:
+## User workflow
+
+### Reserve inventory
+
+In a DM, send:
+
+```text
+reserve
+```
+
+In a channel where the bot has been invited, send:
+
+```text
+@InventoryBot reserve
+```
+
+The bot posts an **Open reservation form** button. The form lets the requester
+choose up to 20 items sharing the same start and end time. The Start picker
+defaults to now and the End picker defaults to one hour later. Leaving the
+default Start unchanged uses the exact submission time.
+
+Submitting the form does not immediately mean the inventory is reserved. Slack
+first reports that the request is queued. The worker then rereads the latest
+Google Sheet, processes queued work in order, and sends a separate confirmation
+or failure message.
+
+The same modal can be opened from Slack's global **Reserve an item** shortcut.
+
+### Check status
+
+```text
+status
+status kayak1
+```
+
+The full status command shows the inventory list. A specific-item status reports
+its current holder and end time, or its next scheduled reservation.
+
+### Cancel reservations
+
+```text
+cancel
+cancel kayak1
+cancel group kayak1
+```
+
+- `cancel` opens **Manage Reservations**, listing only the requester's active and
+  upcoming reservation groups.
+- `cancel <item>` cancels only that item from the requester's current reservation,
+  or their sole upcoming reservation for that item.
+- `cancel group <item>` explicitly cancels every item sharing the selected
+  reservation's group ID.
+- A confirmed reservation message also includes a **Manage reservation** button.
+
+If an item has multiple upcoming reservations, the bot asks the requester to
+choose the intended time instead of guessing.
+
+### Command summary
 
 ```text
 reserve
 status
-status kayak1
-cancel kayak1
-cancel group kayak1
+status <item>
+cancel
+cancel <item>
+cancel group <item>
 help
 ```
 
-The reservation flow is to send `reserve`, click **Open reservation
-form**, and select up to 20 items that need the same start and end time. The
-combined **Start** picker defaults to now and the combined **End** picker defaults
-to one hour later. Change either the date or time directly; no separate start-mode
-choice is needed. Leaving the default Start unchanged uses the exact submission
-time.
+## Architecture
 
-## Availability model
+```text
+Slack DM, mention, or shortcut
+             |
+             v
+      Slack Bolt handlers
+             |
+             v
+ Durable SQLite request queue
+             |
+             v
+ Reservation and conflict service
+             |
+             v
+       Google Sheets API
+        /             \
+   Items view    Reservations schedule
+             |
+             v
+    Slack result notification
+```
 
-The `Reservations` tab is the schedule source of truth:
+The implementation separates Slack presentation, reservation rules, persistence,
+and queue processing:
+
+| Component | Responsibility |
+|---|---|
+| `slack_app.py` | Slack events, actions, modal submissions, and messages |
+| `slack_views.py` | Block Kit launchers, reservation forms, and cancellation forms |
+| `service.py` | Item resolution, overlap checks, commits, cancellation, and reconciliation |
+| `sheets.py` | Google Sheets schemas, reads, batched writes, and migrations |
+| `reservation_queue.py` | Durable FIFO requests, retries, deduplication, and recovery |
+| `config.py` | `.env` loading and startup validation |
+| `init_sheet.py` | New-sheet initialization and supported schema migrations |
+
+## Inventory and schedule model
+
+### `Items`: live operational view
+
+Each row represents one unique reservable item with implicit quantity 1:
+
+| item_name | location | reservation_end | reserved_by |
+|---|---|---|---|
+| kayak1 | A |  |  |
+| kayak2 | B |  |  |
+| camera1 | Equipment Room |  |  |
+
+Inventory maintainers edit `item_name` and `location`. The bot manages
+`reservation_end` and `reserved_by` for the currently active reservation.
+
+Item names must be unique, including capitalization-only differences. Exact names
+are preferred; partial names work only when exactly one item matches.
+
+### `Reservations`: schedule source of truth
+
+Confirmed schedule rows use this model:
 
 | reservation_id | group_id | item_name | start_time | end_time | reserved_by | slack_user_id |
 |---|---|---|---|---|---|---|
 | generated UUID | shared group UUID | kayak1 | 2026-07-18 01:00 PM PDT (UTC-07:00) | 2026-07-18 05:00 PM PDT (UTC-07:00) | Taylor Smith | U123... |
 | generated UUID | shared group UUID | paddle1 | 2026-07-18 01:00 PM PDT (UTC-07:00) | 2026-07-18 05:00 PM PDT (UTC-07:00) | Taylor Smith | U123... |
 
-The bot validates every selected item before writing any of them, then appends
-one row per item with a shared `group_id`. If any selected item overlaps, the
-whole attempt fails and no new rows are written. Because the `[start, end)` end
-is exclusive, one reservation may start exactly when the previous one ends.
+One row is written per item. Items submitted together share a `group_id`, allowing
+the bot to cancel selected items or the whole reservation as one logical group.
 
-The `Items` tab remains the simple live inventory view:
+The bot treats each interval as `[start, end)`: start is inclusive and end is
+exclusive. A reservation may therefore begin exactly when the previous one ends.
+If any selected item overlaps, the entire multi-item request fails and no new
+schedule rows are written.
 
-| item_name | location | reservation_end | reserved_by |
-|---|---|---|---|
-| kayak1 | A |  |  |
-| kayak2 | B |  |  |
-| kayak3 | A |  |  |
+Times are stored in a readable, timezone-qualified format such as
+`2026-07-18 05:00 PM PDT (UTC-07:00)`. The abbreviation is convenient for people;
+the numeric offset preserves the exact instant if daylight-saving rules or the
+configured timezone later change. Existing ISO/UTC timestamps remain readable.
 
-- Before a future reservation starts, its `Items` row remains available.
-- Within 30 seconds after the start, the bot writes its end time and holder name
-  into `Items`.
-- Within 30 seconds after the end, the bot clears the two live-state cells and
-  removes the ended row from `Reservations`.
-- The same reconciliation runs immediately at startup, so downtime is repaired.
-- `cancel <item>` cancels only that item from the person's active reservation, or
-  their sole upcoming reservation for that item.
-- `cancel` opens Manage Reservations, where the owner chooses a reservation and
-  checks exactly which items to cancel. Confirmed reservation messages also have
-  a **Manage reservation** button.
-- `cancel group <item>` explicitly cancels every item sharing the selected
-  reservation's `group_id`.
-- When an item has multiple upcoming reservations, the manager asks the user to
-  choose by time instead of guessing which one to cancel.
-- Every item implicitly has quantity 1.
-- Item names must be unique; the name acts as the lookup key.
-- Partial names work only when they match exactly one item.
+## Reconciliation behavior
 
-The bot writes readable timestamps such as
-`2026-07-18 05:00 PM PDT (UTC-07:00)`, using `INVENTORY_TIMEZONE`. The numeric
-offset preserves the exact instant even if daylight-saving rules or the configured
-timezone later change. Existing ISO/UTC timestamps such as
-`2026-07-19T00:00:00Z` remain supported.
+The `Reservations` tab is authoritative for scheduled work; `Items` is a live
+projection of the currently active reservation:
 
-## Request queue and source of truth
+- A future reservation does not mark the item unavailable in `Items` before its
+  start time.
+- Within 30 seconds after a reservation starts, the reconciler writes the end
+  time and holder name into the corresponding `Items` row.
+- Within 30 seconds after it ends, the reconciler clears those live-state cells
+  and removes the ended schedule row.
+- Reconciliation also runs immediately at startup, repairing live state after
+  downtime.
+- Clearing only the live `Items` cells is temporary while an active schedule row
+  still exists; reconciliation restores them.
 
-Google Sheets remains the complete user-facing inventory and confirmed schedule
-source of truth. The bot also creates
-`.inventory_bot/reservation_queue.sqlite3` locally, but inventory maintainers do
-not need to open or manage it. That file contains only pending requests, retry
-state, duplicate-submission keys, and recent processing outcomes.
+A sheet manager can manually cancel a scheduled item by clearing its complete row
+in `Reservations`. Clearing every row with the same `group_id` cancels the whole
+group.
 
-When someone submits a reservation, Slack first says that the request is queued
-and explicitly not confirmed. The bot then processes requests first-in,
-first-out, rereads the latest sheet, and sends a separate confirmed or failed
-result. Overlapping requests still fail normally; the earliest queued compatible
-request wins. A multi-item request remains all-or-nothing.
+## Queue and reliability model
 
-The default rate is four reservation groups per minute. Temporary Google errors
-are retried with increasing delays, up to eight attempts. If the bot restarts,
-requests that were waiting or processing are recovered. The queue request ID is
-also used as the confirmed sheet `group_id`, so retrying a write that actually
-succeeded cannot create a duplicate reservation. Finished, successfully
-notified queue records are retained for 30 days and then removed automatically.
+Google Sheets remains the user-facing inventory and confirmed-schedule source of
+truth. The bot also creates `.inventory_bot/reservation_queue.sqlite3` locally.
+This database contains only pending requests, retry state, duplicate-submission
+keys, notification state, and recent processing outcomes.
 
-Do not delete the SQLite file while requests are pending. Deleting it does not
-remove reservations already confirmed in Google Sheets, but it would discard
-requests still waiting to be processed.
+The queue provides:
 
-## 1. Create the Slack app
+- stable FIFO ordering, including identical submission times;
+- a conservative default of four reservation groups per minute;
+- increasing delays for temporary Google failures;
+- up to eight processing attempts by default;
+- recovery of requests interrupted by a restart;
+- independent retries for Slack notifications;
+- a queue request ID reused as the sheet `group_id`, preventing duplicate rows if
+  a write succeeds but its response is lost; and
+- automatic removal of successfully completed and notified queue records after
+  30 days.
 
-1. Go to Slack API **Your Apps** and choose **Create New App**.
-2. Choose **From an app manifest** and paste [slack-manifest.yaml](slack-manifest.yaml).
-3. Under **Basic Information > App-Level Tokens**, generate an `xapp-` token with
-   the `connections:write` scope.
-4. Install the app to the workspace and copy its `xoxb-` bot token.
-5. Invite the bot to each channel where it should accept mentions.
+Availability is checked against the latest sheet immediately before each commit.
+The earliest compatible queued request wins; expected overlap conflicts fail
+normally and are not retried.
 
-For an app that was created before the reservation modal was added:
+Do not delete or move the SQLite database while requests are pending. If the bot
+must move computers, let the queue drain first or stop the process and move the
+database together with any `-wal` and `-shm` companion files.
 
-1. Open the app's **App Manifest** page in Slack.
-2. Replace the YAML with the current [slack-manifest.yaml](slack-manifest.yaml).
-3. Save the changes and reinstall the app if Slack prompts you.
+## Configuration model
 
-This adds the global **Reserve an item** shortcut. The message button and modal
-still work without the global shortcut after the bot code is restarted.
+Configuration is read from `.env` or existing process environment variables.
+See [SETUP.md](SETUP.md) for where each credential comes from and how to configure
+it safely.
 
-The manifest enables Socket Mode, the App Home Messages tab, interactive buttons,
-and these bot scopes/events:
+| Variable | Purpose |
+|---|---|
+| `SLACK_BOT_TOKEN` | Workspace bot token beginning with `xoxb-` |
+| `SLACK_APP_TOKEN` | Socket Mode app token beginning with `xapp-` |
+| `GOOGLE_SPREADSHEET_ID` | ID of the shared inventory spreadsheet |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Local path to the service-account JSON key |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Alternative inline credential for hosted secret stores |
+| `INVENTORY_TIMEZONE` | Timezone used for sheet display and reservation interpretation |
+| `ITEMS_SHEET` | Items tab name; defaults to `Items` |
+| `RESERVATIONS_SHEET` | Schedule tab name; defaults to `Reservations` |
+| `ALLOWED_CHANNEL_IDS` | Optional comma-separated Slack channel allowlist |
+| `ALLOWED_USER_IDS` | Optional comma-separated Slack user allowlist |
+| `RESERVATION_QUEUE_DATABASE` | Local SQLite queue path |
+| `RESERVATION_QUEUE_RATE_PER_MINUTE` | Queue processing rate; defaults to 4 |
+| `RESERVATION_QUEUE_MAX_ATTEMPTS` | Maximum temporary-failure attempts; defaults to 8 |
+| `RESERVATION_QUEUE_RETENTION_DAYS` | Completed queue retention; defaults to 30 |
+| `ITEM_PICKER_CACHE_SECONDS` | Item search cache duration; defaults to 15 |
 
-- `chat:write`
-- `app_mentions:read` / `app_mention`
-- `im:history` / `message.im`
-- `users:read` for the reservation holder's display or real name
+Set only one of `GOOGLE_SERVICE_ACCOUNT_FILE` and
+`GOOGLE_SERVICE_ACCOUNT_JSON`. When neither is set, Google Application Default
+Credentials are used.
 
-After adding `users:read` to an existing app, reinstall the app to the workspace
-so Slack grants the new permission, then restart `inventory-bot`. Email access is
-not requested or needed.
+## Running an already configured installation
 
-## 2. Create Google credentials and the sheet
-
-1. Create or select a Google Cloud project.
-2. Enable the **Google Sheets API**.
-3. Create a service account and, for local development, download a JSON key.
-4. Create a Google Sheet and share it with the service account's email as an editor.
-5. Copy the spreadsheet ID from the URL between `/d/` and `/edit`.
-
-Keep the JSON key outside this repository. The `.gitignore` also excludes common
-service-account filenames as a second line of defense.
-
-When deployed on Google Cloud, omit the key file and give the runtime service
-account access to the sheet; the bot will use Application Default Credentials.
-
-## 3. Install and configure locally
-
-### Easiest Windows setup
-
-Install Python 3.11 or newer, then double-click **Initialize Inventory Sheet.exe**
-in the project folder. On its first run, the launcher will:
-
-1. Create the local `.venv` Python environment if it does not exist.
-2. Install the inventory bot into that environment.
-3. Copy `.env.example` to `.env` if needed and open it in Notepad.
-4. Let you initialize a new sheet or choose one of the supported migrations.
-
-The setup window stays open so success messages and errors can be read. Internet
-access is needed the first time dependencies are installed.
-
-For a manual installation, use PowerShell:
-
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-Copy-Item .env.example .env
-notepad .env
-```
-
-Run these commands from the folder containing `pyproject.toml`. Activating the
-virtual environment is optional; using its `python.exe` directly avoids Windows
-PowerShell execution-policy and command-path problems. Python 3.11 or newer is
-supported.
-
-Edit `.env`:
-
-```dotenv
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_APP_TOKEN=xapp-...
-GOOGLE_SPREADSHEET_ID=...
-GOOGLE_SERVICE_ACCOUNT_FILE=C:\secure-path\service-account.json
-INVENTORY_TIMEZONE=America/Los_Angeles
-```
-
-`GOOGLE_SERVICE_ACCOUNT_FILE` must name the downloaded `.json` file itself, not
-the folder containing it. You can verify a path before setup with:
-
-```powershell
-Test-Path -LiteralPath "C:\secure-path\service-account.json" -PathType Leaf
-```
-
-The result must be `True`. Both Windows launchers also run a configuration
-preflight and report placeholder tokens, a missing spreadsheet ID, a missing key
-file, or a key path that points to a directory before starting the Python command.
-
-`GOOGLE_SERVICE_ACCOUNT_JSON` can be used instead of a file when a deployment
-platform provides credentials as a secret environment variable.
-
-## 4. Initialize or migrate the spreadsheet
-
-For a new empty spreadsheet, double-click **Initialize Inventory Sheet.exe** and
-choose option 1. The other menu options migrate the older sheet layouts described
-below.
-
-The equivalent manual command is:
-
-```powershell
-.\.venv\Scripts\python.exe -m inventory_bot.init_sheet
-```
-
-If the `Items` tab still has the original six-column layout, or the earlier
-`item_name, location, active, reservation_end` layout, stop the bot and run:
-
-```powershell
-.\.venv\Scripts\python.exe -m inventory_bot.init_sheet --migrate-items
-```
-
-The migration duplicates the current tab to a timestamped `Items Backup ...` tab
-before converting it.
-
-For this scheduled-reservation upgrade, initialize the new schedule tab with:
-
-```powershell
-.\.venv\Scripts\python.exe -m inventory_bot.init_sheet --migrate-reservations
-```
-
-If the earlier six-column `Reservations` tab exists, the command copies it to a
-timestamped `Reservations Backup ...` tab and preserves every schedule row while
-adding a `group_id`. Each older single-item row becomes its own group. Any active
-state found only in `Items` is seeded into the schedule so it is not lost.
-
-After migration, add or edit items in the first two columns only:
-
-| item_name | location | reservation_end | reserved_by |
-|---|---|---|---|
-| kayak1 | A |  |  |
-| kayak2 | B |  |  |
-
-Normally, leave `reservation_end` and `reserved_by` for the bot to manage. To
-release selected items early, send `cancel` and use Manage Reservations, or send
-`cancel <item>` for one item. A sheet manager can cancel an item by clearing its
-complete row in `Reservations`; clear every row with the same `group_id` to cancel
-the entire group. The bot will then reconcile `Items`. Clearing only the live
-`Items` cells is temporary because an active schedule row will restore them. A
-`-` is accepted as an empty reservation end, though a blank cell is preferred.
-
-## 5. Run the bot
-
-Double-click **Start Inventory Bot.exe**. Keep its window open while the bot is
-running; closing the window stops the bot. The launcher always starts in the
-project folder, so it loads the correct `.env` and local queue database.
-
-The equivalent manual command is:
+On Windows, double-click **Start Inventory Bot.exe** and keep its window open.
+The direct equivalent is:
 
 ```powershell
 .\.venv\Scripts\python.exe -m inventory_bot
 ```
 
-In Slack, use either:
-
-```text
-reserve
-@InventoryBot reserve
-```
-
-Then click **Open reservation form**. The multi-select searches the current
-Google Sheet and lets the user choose up to 20 configured items. Slack displays
-the combined datetime pickers in the user's local Slack timezone; confirmations
-and sheet timestamps use `INVENTORY_TIMEZONE`. Every selected item is checked
-again when the reservation is committed.
-
-Send `cancel` to open the cancellation launcher. The manager lists only the
-requester's active and upcoming reservations, then provides an item multi-select plus
-an explicitly confirmed **Cancel entire reservation** action. Send `help` at any
-time for the full command overview.
-
-The process must stay running to receive Socket Mode events. For production,
-deploy one continuously running instance and place all tokens and Google
-credentials in the hosting platform's secret store.
-
-Optional allowlists can restrict use:
-
-```dotenv
-ALLOWED_CHANNEL_IDS=C01234567,C07654321
-ALLOWED_USER_IDS=U01234567,U07654321
-```
-
-Direct messages bypass the channel allowlist but still honor the user allowlist.
-
-The request-buffer defaults normally do not need to be changed. They can be
-overridden in `.env` when needed:
-
-```dotenv
-RESERVATION_QUEUE_DATABASE=.inventory_bot/reservation_queue.sqlite3
-RESERVATION_QUEUE_RATE_PER_MINUTE=4
-RESERVATION_QUEUE_MAX_ATTEMPTS=8
-RESERVATION_QUEUE_RETENTION_DAYS=30
-ITEM_PICKER_CACHE_SECONDS=15
-```
-
-Keep one running bot instance and store the queue on persistent local storage.
-If the bot is moved to another computer while requests are pending, stop it and
-copy the SQLite file along with its `-wal` and `-shm` companion files, or wait
-for the queue to drain before moving it.
+For first-time initialization, credential setup, Slack workspace configuration,
+spreadsheet migration, or troubleshooting, use [SETUP.md](SETUP.md).
 
 ## Tests
 
-Run the automated tests and source compilation checks from the configured
-environment:
+Run the automated tests and source compilation checks from the project folder:
 
 ```powershell
-python -m unittest discover -v
-python -m compileall -q src
+.\.venv\Scripts\python.exe -m unittest discover -v
+.\.venv\Scripts\python.exe -m compileall -q src tests
 ```
 
-## Current MVP limits
+Rebuild the Windows launchers after changing their C# source:
 
-- The SQLite queue and process-level lock protect one bot instance. Do not run
-  multiple instances against the same sheet with separate local queue files.
-- Multi-item schedule appends, live-state updates, and cancellations use batched
-  Google Sheets requests, so selecting several items does not multiply the main
-  API request count one-for-one.
-- New scheduled rows retain the Slack user ID internally for owner-safe
-  cancellation; `Items` still shows only the readable holder name.
-- Ended schedule rows are removed, so the sheet does not provide reservation
-  history.
-- Google Sheets is appropriate for a modest internal inventory. A transactional
-  database should replace it if reservation volume or business criticality grows.
+```powershell
+.\windows-launchers\build-launchers.ps1
+```
+
+## Current limitations
+
+- Run one bot instance. Separate instances do not share the process lock or local
+  SQLite queue.
+- Google Sheets is suitable for a modest internal inventory, not a high-volume
+  transactional system.
+- Each `Items` row is one unit; pooled quantities are represented as multiple
+  uniquely named rows.
+- Ended schedule rows are removed, so the Google Sheet is not a permanent
+  reservation-history ledger.
+- New reservation rows retain the Slack user ID for owner-safe cancellation;
+  `Items` displays only the readable holder name.
+- Credentials and the local queue require deliberate handling when the bot moves
+  to another computer or hosting environment.
