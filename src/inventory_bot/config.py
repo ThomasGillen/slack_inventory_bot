@@ -33,6 +33,17 @@ def _csv_set(value: str | None) -> frozenset[str]:
     return frozenset(part.strip() for part in (value or "").split(",") if part.strip())
 
 
+def _is_placeholder(value: str) -> bool:
+    normalized = value.strip().casefold()
+    return normalized.endswith("...") or normalized in {
+        "...",
+        "your-spreadsheet-id",
+        "xoxb-your-bot-token",
+        "xapp-your-socket-mode-token",
+        "xapp-your-app-token",
+    }
+
+
 def _float_setting(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
@@ -79,7 +90,9 @@ class Settings:
             timezone_name=os.getenv("INVENTORY_TIMEZONE", "America/Los_Angeles").strip(),
             slack_bot_token=os.getenv("SLACK_BOT_TOKEN", "").strip(),
             slack_app_token=os.getenv("SLACK_APP_TOKEN", "").strip(),
-            service_account_file=os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE") or None,
+            service_account_file=(
+                os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip() or None
+            ),
             service_account_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or None,
             items_sheet=os.getenv("ITEMS_SHEET", "Items").strip(),
             reservations_sheet=os.getenv(
@@ -117,6 +130,48 @@ class Settings:
             missing.append("SLACK_APP_TOKEN")
         if missing:
             raise ConfigurationError(f"Missing required settings: {', '.join(missing)}")
+        if _is_placeholder(self.spreadsheet_id):
+            raise ConfigurationError(
+                "Replace GOOGLE_SPREADSHEET_ID in .env with the ID from the Google Sheet URL."
+            )
+        if require_slack and (
+            _is_placeholder(self.slack_bot_token)
+            or not self.slack_bot_token.startswith("xoxb-")
+        ):
+            raise ConfigurationError(
+                "SLACK_BOT_TOKEN must be the Bot User OAuth Token beginning with xoxb-."
+            )
+        if require_slack and (
+            _is_placeholder(self.slack_app_token)
+            or not self.slack_app_token.startswith("xapp-")
+        ):
+            raise ConfigurationError(
+                "SLACK_APP_TOKEN must be an app-level Socket Mode token beginning with xapp-."
+            )
+        if self.service_account_file and self.service_account_json:
+            raise ConfigurationError(
+                "Set either GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_SERVICE_ACCOUNT_JSON, not both."
+            )
+        key_path = self.service_account_path
+        if key_path is not None:
+            if key_path.is_dir():
+                raise ConfigurationError(
+                    "GOOGLE_SERVICE_ACCOUNT_FILE points to a directory. "
+                    f"Set it to the downloaded service-account .json file: {key_path}"
+                )
+            if not key_path.exists():
+                raise ConfigurationError(
+                    f"GOOGLE_SERVICE_ACCOUNT_FILE does not exist: {key_path}"
+                )
+            if not key_path.is_file():
+                raise ConfigurationError(
+                    f"GOOGLE_SERVICE_ACCOUNT_FILE is not a regular file: {key_path}"
+                )
+            if key_path.suffix.casefold() != ".json":
+                raise ConfigurationError(
+                    "GOOGLE_SERVICE_ACCOUNT_FILE must point to the downloaded "
+                    f"service-account .json file: {key_path}"
+                )
         if not self.reservation_queue_database:
             raise ConfigurationError("RESERVATION_QUEUE_DATABASE cannot be empty.")
         if (
@@ -147,6 +202,12 @@ class Settings:
             raise ConfigurationError(
                 f"Unknown INVENTORY_TIMEZONE: {self.timezone_name}"
             ) from exc
+
+    @property
+    def service_account_path(self) -> Path | None:
+        if not self.service_account_file:
+            return None
+        return Path(os.path.expandvars(self.service_account_file)).expanduser()
 
     @property
     def timezone(self) -> ZoneInfo:

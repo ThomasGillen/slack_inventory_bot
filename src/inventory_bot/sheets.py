@@ -202,11 +202,16 @@ class GoogleSheetsRepository:
             credentials = service_account.Credentials.from_service_account_info(
                 info, scopes=[SHEETS_SCOPE]
             )
-        elif self.settings.service_account_file:
-            key_path = Path(self.settings.service_account_file).expanduser()
-            if not key_path.exists():
+        elif self.settings.service_account_path is not None:
+            key_path = self.settings.service_account_path
+            if key_path.is_dir():
                 raise ConfigurationError(
-                    f"GOOGLE_SERVICE_ACCOUNT_FILE does not exist: {key_path}"
+                    "GOOGLE_SERVICE_ACCOUNT_FILE points to a directory. "
+                    f"Set it to the downloaded service-account .json file: {key_path}"
+                )
+            if not key_path.is_file():
+                raise ConfigurationError(
+                    f"GOOGLE_SERVICE_ACCOUNT_FILE does not exist or is not a file: {key_path}"
                 )
             credentials = service_account.Credentials.from_service_account_file(
                 str(key_path), scopes=[SHEETS_SCOPE]

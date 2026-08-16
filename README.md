@@ -163,14 +163,32 @@ account access to the sheet; the bot will use Application Default Credentials.
 
 ## 3. Install and configure locally
 
-PowerShell:
+### Easiest Windows setup
+
+Install Python 3.11 or newer, then double-click **Initialize Inventory Sheet.exe**
+in the project folder. On its first run, the launcher will:
+
+1. Create the local `.venv` Python environment if it does not exist.
+2. Install the inventory bot into that environment.
+3. Copy `.env.example` to `.env` if needed and open it in Notepad.
+4. Let you initialize a new sheet or choose one of the supported migrations.
+
+The setup window stays open so success messages and errors can be read. Internet
+access is needed the first time dependencies are installed.
+
+For a manual installation, use PowerShell:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
 Copy-Item .env.example .env
+notepad .env
 ```
+
+Run these commands from the folder containing `pyproject.toml`. Activating the
+virtual environment is optional; using its `python.exe` directly avoids Windows
+PowerShell execution-policy and command-path problems. Python 3.11 or newer is
+supported.
 
 Edit `.env`:
 
@@ -182,22 +200,37 @@ GOOGLE_SERVICE_ACCOUNT_FILE=C:\secure-path\service-account.json
 INVENTORY_TIMEZONE=America/Los_Angeles
 ```
 
+`GOOGLE_SERVICE_ACCOUNT_FILE` must name the downloaded `.json` file itself, not
+the folder containing it. You can verify a path before setup with:
+
+```powershell
+Test-Path -LiteralPath "C:\secure-path\service-account.json" -PathType Leaf
+```
+
+The result must be `True`. Both Windows launchers also run a configuration
+preflight and report placeholder tokens, a missing spreadsheet ID, a missing key
+file, or a key path that points to a directory before starting the Python command.
+
 `GOOGLE_SERVICE_ACCOUNT_JSON` can be used instead of a file when a deployment
 platform provides credentials as a secret environment variable.
 
 ## 4. Initialize or migrate the spreadsheet
 
-For a new empty spreadsheet:
+For a new empty spreadsheet, double-click **Initialize Inventory Sheet.exe** and
+choose option 1. The other menu options migrate the older sheet layouts described
+below.
+
+The equivalent manual command is:
 
 ```powershell
-inventory-sheet-init
+.\.venv\Scripts\python.exe -m inventory_bot.init_sheet
 ```
 
 If the `Items` tab still has the original six-column layout, or the earlier
 `item_name, location, active, reservation_end` layout, stop the bot and run:
 
 ```powershell
-inventory-sheet-init --migrate-items
+.\.venv\Scripts\python.exe -m inventory_bot.init_sheet --migrate-items
 ```
 
 The migration duplicates the current tab to a timestamped `Items Backup ...` tab
@@ -206,7 +239,7 @@ before converting it.
 For this scheduled-reservation upgrade, initialize the new schedule tab with:
 
 ```powershell
-inventory-sheet-init --migrate-reservations
+.\.venv\Scripts\python.exe -m inventory_bot.init_sheet --migrate-reservations
 ```
 
 If the earlier six-column `Reservations` tab exists, the command copies it to a
@@ -231,8 +264,14 @@ the entire group. The bot will then reconcile `Items`. Clearing only the live
 
 ## 5. Run the bot
 
+Double-click **Start Inventory Bot.exe**. Keep its window open while the bot is
+running; closing the window stops the bot. The launcher always starts in the
+project folder, so it loads the correct `.env` and local queue database.
+
+The equivalent manual command is:
+
 ```powershell
-inventory-bot
+.\.venv\Scripts\python.exe -m inventory_bot
 ```
 
 In Slack, use either:
